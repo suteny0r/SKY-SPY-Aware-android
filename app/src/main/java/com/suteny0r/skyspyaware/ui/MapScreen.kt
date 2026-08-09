@@ -31,8 +31,9 @@ import com.suteny0r.skyspyaware.LocationController
 import org.osmdroid.events.MapListener
 import org.osmdroid.events.ScrollEvent
 import org.osmdroid.events.ZoomEvent
-import org.osmdroid.tileprovider.tilesource.XYTileSource
+import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.util.GeoPoint
+import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.CustomZoomButtonsController
 import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
@@ -44,13 +45,22 @@ private const val INITIAL_ZOOM = 14.0
 data class MapCamera(val lat: Double, val lon: Double, val zoom: Double)
 
 // ESRI World Imagery satellite tiles - free, no API key required.
-private val ESRI_SAT = XYTileSource(
+// osmdroid's XYTileSource appends /z/x/y, but ESRI expects /z/y/x, so we
+// build the URL ourselves.
+class EsriSatelliteTileSource : OnlineTileSourceBase(
     "ESRI_World_Imagery",
-    0, 19, 256, ".jpg",
-    arrayOf(
-        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
-    )
-)
+    0, 19, 256,
+    ".jpg",
+    arrayOf("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile")
+) {
+    override fun getTileURLString(pMapTileIndex: Long): String =
+        getBaseUrl() + "/" +
+            MapTileIndex.getZoom(pMapTileIndex) + "/" +
+            MapTileIndex.getY(pMapTileIndex) + "/" +
+            MapTileIndex.getX(pMapTileIndex) + mImageFilenameEnding
+}
+
+val ESRI_SAT = EsriSatelliteTileSource()
 
 private object IconCache {
     fun drone(altitude: Int): Bitmap =

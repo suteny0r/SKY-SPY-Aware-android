@@ -26,11 +26,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        Configuration.getInstance().load(
-            applicationContext,
-            androidx.preference.PreferenceManager
-                .getDefaultSharedPreferences(applicationContext)
-        )
+
+        // osmdroid requires an explicit User-Agent or tile servers reject the
+        // request with HTTP 400 (getUserAgentValue() is null otherwise).
+        val prefs = androidx.preference.PreferenceManager
+            .getDefaultSharedPreferences(applicationContext)
+        Configuration.getInstance().load(applicationContext, prefs)
+        Configuration.getInstance().userAgentValue =
+            "SKY-SPY-Aware/1.0 (Android; +https://github.com/suteny0r/SKY-SPY-Aware-android)"
 
         val fineGranted = ContextCompat.checkSelfPermission(
             this, Manifest.permission.ACCESS_FINE_LOCATION
