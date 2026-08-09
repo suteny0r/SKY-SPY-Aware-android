@@ -9,9 +9,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -31,7 +33,10 @@ import com.suteny0r.skyspyaware.LocationController
 import org.osmdroid.events.MapListener
 import org.osmdroid.events.ScrollEvent
 import org.osmdroid.events.ZoomEvent
+import org.osmdroid.tileprovider.tilesource.ITileSource
 import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.tileprovider.tilesource.XYTileSource
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.CustomZoomButtonsController
@@ -61,6 +66,18 @@ class EsriSatelliteTileSource : OnlineTileSourceBase(
 }
 
 val ESRI_SAT = EsriSatelliteTileSource()
+
+/** Selectable base map styles. */
+val MAP_STYLES: List<ITileSource> = listOf(
+    ESRI_SAT,
+    TileSourceFactory.MAPNIK,
+    XYTileSource(
+        "CARTO_Dark",
+        0, 19, 256, ".png",
+        arrayOf("https://basemaps.cartocdn.com/dark_all")
+    )
+)
+val MAP_STYLE_NAMES = listOf("Satellite", "Street", "Dark")
 
 private object IconCache {
     fun drone(altitude: Int): Bitmap =
@@ -99,6 +116,11 @@ fun MapScreen(
     savedCamera: MapCamera?,
     onCameraChange: (MapCamera) -> Unit,
     drones: List<Drone>,
+    mapStyle: Int,
+    onStyleChange: (Int) -> Unit,
+    onDroneSelected: (String) -> Unit,
+    focusKey: String?,
+    focusTick: Int,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -108,10 +130,24 @@ fun MapScreen(
     // [savedCamera] instead.
     val mapView = remember(context) {
         MapView(context).apply {
-            setTileSource(ESRI_SAT)
+            setTileSource(MAP_STYLES[mapStyle.coerceIn(0, MAP_STYLES.lastIndex)])
             setMultiTouchControls(true)
             zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
             controller.setZoom(INITIAL_ZOOM)
+        }
+    }
+
+    // Switch base map style when the selection changes.
+    LaunchedEffect(mapStyle) {
+        mapView.setTileSource(MAP_STYLES[mapStyle.coerceIn(0, MAP_STYLES.lastIndex)])
+    }
+
+    // Center on a drone when the user requests it (list tap / marker tap).
+    LaunchedEffect(focusTick) {
+        if (focusKey != null) {
+            drones.firstOrNull { it.key == focusKey }?.let {
+                mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
+            }
         }
     }
 
@@ -186,6 +222,10 @@ fun MapScreen(
                         icon = IconCache.drone(d.droneAltitude)
                             .toDrawable(context.resources)
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                        setOnMarkerClickListener { _, _ ->
+                            onDroneSelected(d.key)
+                            true
+                        }
                         mapView.overlays.add(this)
                     }
                 }
@@ -222,6 +262,17 @@ fun MapScreen(
                 }
             }
             mapView.invalidate()
+        }
+
+        SmallFloatingActionButton(
+            onClick = {
+                onStyleChange((mapStyle + 1) % MAP_STYLES.size)
+            },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(16.dp)
+        ) {
+            Icon(Icons.Filled.Layers, contentDescription = "Change map style")
         }
 
         FloatingActionButton(

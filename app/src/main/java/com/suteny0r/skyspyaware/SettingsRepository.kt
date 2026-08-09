@@ -41,6 +41,13 @@ class SettingsRepository(context: Context) {
             .apply()
     }
 
+    /** Map style index into [com.suteny0r.skyspyaware.ui.MAP_STYLES]. */
+    fun getMapStyle(): Int = prefs.getInt("mapStyle", 0)
+
+    fun setMapStyle(index: Int) {
+        prefs.edit().putInt("mapStyle", index).apply()
+    }
+
     companion object {
         const val DEFAULT_BROKER = "65604cba457d4f8992aefe5820219ae4.s1.eu.hivemq.cloud"
         const val DEFAULT_PORT = 8883

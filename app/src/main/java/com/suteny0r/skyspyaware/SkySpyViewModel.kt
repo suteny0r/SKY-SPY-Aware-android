@@ -35,11 +35,16 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected.asStateFlow()
 
+    private val _faa = MutableStateFlow<Map<String, String>>(emptyMap())
+    val faa: StateFlow<Map<String, String>> = _faa.asStateFlow()
+
     private val droneMap = LinkedHashMap<String, Drone>()
     private val consoleBuffer = ArrayDeque<String>()
+    private val faaCache = HashMap<String, String>()
 
     private val ageScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var ageJob: Job? = null
+    private val faaScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
         mqtt.onLine = { line -> handleLine(line) }
@@ -99,6 +104,23 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
             )
             _drones.value = droneMap.values.toList()
         }
+        if (d.basicId.isNotBlank()) faaLookup(d.basicId)
+    }
+
+    private fun faaLookup(basicId: String) {
+        synchronized(faaCache) {
+            if (faaCache.containsKey(basicId)) return
+            faaCache[basicId] = "" // mark in-flight
+        }
+        faaScope.launch {
+            val result = try {
+                FaaClient.lookup(basicId)
+            } catch (e: Exception) {
+                "Lookup failed: ${e.message}"
+            }
+            synchronized(faaCache) { faaCache[basicId] = result }
+            _faa.value = HashMap(faaCache)
+        }
     }
 
     private fun ageOut() {
@@ -129,11 +151,14 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
 
     fun settings(): MqttSettings = settingsRepo.load()
     fun saveSettings(s: MqttSettings) = settingsRepo.save(s)
+    fun getMapStyle(): Int = settingsRepo.getMapStyle()
+    fun setMapStyle(index: Int) = settingsRepo.setMapStyle(index)
 
     override fun onCleared() {
         mqtt.disconnect()
         ageJob?.cancel()
         ageScope.cancel()
+        faaScope.cancel()
         super.onCleared()
     }
 }
