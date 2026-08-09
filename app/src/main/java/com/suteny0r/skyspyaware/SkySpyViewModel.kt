@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 
 private const val DRONE_TIMEOUT_MS = 60_000L
 private const val CONSOLE_LIMIT = 500
+private const val TRAIL_MAX = 60
 
 class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -48,6 +49,8 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
                 ageOut()
             }
         }
+        // Auto-connect to the stored broker on startup.
+        connect()
     }
 
     private fun handleLine(line: String) {
@@ -61,18 +64,38 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
         val key = d.basicId.ifBlank { d.mac }
         synchronized(droneMap) {
             val prev = droneMap[key]
+            val macPositions = (prev?.macPositions ?: emptyMap()).toMutableMap()
+            val lastForMac = macPositions[d.mac]
+            // A drone can broadcast on multiple MACs (AP beacon vs NAN) with
+            // different positions. Only advance when THIS MAC reports a
+            // changed position, or the drone position flip-flops every frame.
+            val macChanged = lastForMac == null ||
+                lastForMac.first != d.droneLat || lastForMac.second != d.droneLon
+            if (macChanged) macPositions[d.mac] = d.droneLat to d.droneLon
+
+            val effectiveLat = if (macChanged) d.droneLat else (prev?.droneLat ?: d.droneLat)
+            val effectiveLon = if (macChanged) d.droneLon else (prev?.droneLon ?: d.droneLon)
+            val trail = if (macChanged) {
+                ((prev?.trail ?: emptyList()) + (effectiveLat to effectiveLon))
+                    .takeLast(TRAIL_MAX)
+            } else {
+                prev?.trail ?: listOf(effectiveLat to effectiveLon)
+            }
+
             droneMap[key] = Drone(
                 key = key,
                 mac = d.mac,
                 rssi = d.rssi,
-                droneLat = d.droneLat,
-                droneLon = d.droneLon,
+                droneLat = effectiveLat,
+                droneLon = effectiveLon,
                 droneAltitude = d.droneAltitude,
                 pilotLat = d.pilotLat,
                 pilotLon = d.pilotLon,
                 basicId = d.basicId,
                 lastSeen = now,
-                detections = (prev?.detections ?: 0) + 1
+                detections = (prev?.detections ?: 0) + 1,
+                macPositions = macPositions,
+                trail = trail
             )
             _drones.value = droneMap.values.toList()
         }

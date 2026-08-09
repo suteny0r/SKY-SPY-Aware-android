@@ -51,5 +51,9 @@ data class Drone(
     val pilotLon: Double,
     val basicId: String,
     val lastSeen: Long,
-    val detections: Int
+    val detections: Int,
+    /** Per-MAC last-reported position, to ignore stale beacon frames. */
+    val macPositions: Map<String, Pair<Double, Double>> = emptyMap(),
+    /** Position history (newest last) for the flight-path trail. */
+    val trail: List<Pair<Double, Double>> = emptyList()
 )

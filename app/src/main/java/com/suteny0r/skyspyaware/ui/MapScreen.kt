@@ -111,12 +111,14 @@ fun MapScreen(
             setTileSource(ESRI_SAT)
             setMultiTouchControls(true)
             zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
+            controller.setZoom(INITIAL_ZOOM)
         }
     }
 
     val droneMarkers = remember { LinkedHashMap<String, Marker>() }
     val pilotMarkers = remember { LinkedHashMap<String, Marker>() }
     val lines = remember { LinkedHashMap<String, Polyline>() }
+    val trailLines = remember { LinkedHashMap<String, Polyline>() }
     val myLocation by LocationController.location.collectAsState()
     var userMoved by remember { mutableStateOf(false) }
 
@@ -166,9 +168,19 @@ fun MapScreen(
                 droneMarkers.remove(key)?.let { mapView.overlays.remove(it) }
                 pilotMarkers.remove(key)?.let { mapView.overlays.remove(it) }
                 lines.remove(key)?.let { mapView.overlays.remove(it) }
+                trailLines.remove(key)?.let { mapView.overlays.remove(it) }
             }
 
             for (d in drones) {
+                val trailLine = trailLines.getOrPut(d.key) {
+                    Polyline(mapView).apply {
+                        paint.color = 0x6600BCD4.toInt()
+                        paint.strokeWidth = 3f
+                        mapView.overlays.add(this)
+                    }
+                }
+                trailLine.setPoints(d.trail.map { GeoPoint(it.first, it.second) })
+
                 val dm = droneMarkers.getOrPut(d.key) {
                     Marker(mapView).apply {
                         icon = IconCache.drone(d.droneAltitude)
