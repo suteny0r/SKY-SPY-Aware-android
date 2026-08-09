@@ -5,7 +5,9 @@ Native Android port of [SKY-SPY-Aware](https://github.com/suteny0r/SKY-SPY-Aware
 ## What it does
 
 - **MQTT subscriber (default)** - connects to a broker, subscribes to `skyspy/raw`, and parses detection JSON lines
-- **Live map** - drone markers colored by altitude (green <50m, yellow <150m, orange <400m, red 400m+), pilot pins, and dashed drone-to-pilot lines
+- **Live map** - satellite imagery (ESRI World Imagery), drone markers colored by altitude (green <50m, yellow <150m, orange <400m, red 400m+), pilot pins, and dashed drone-to-pilot lines
+- **Starts at your location** (~5km range, GPS permission prompt on first launch; recenter button bottom-right)
+- **Map camera preserved** when switching between Map / Console / Settings tabs
 - **Console** - scrolling raw feed, detections highlighted
 - **Settings** - broker host/port/TLS/credentials/topic, persisted locally
 - Ships with the public subscribe-only credentials so it works out of the box against the shared feed

@@ -1,12 +1,16 @@
 package com.suteny0r.skyspyaware
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
 import com.suteny0r.skyspyaware.ui.AppRoot
 import com.suteny0r.skyspyaware.ui.SkySpyTheme
 import org.osmdroid.config.Configuration
@@ -15,6 +19,11 @@ class MainActivity : ComponentActivity() {
 
     private val vm: SkySpyViewModel by viewModels()
 
+    private val locationPermLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) LocationController.refresh(applicationContext)
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Configuration.getInstance().load(
@@ -22,6 +31,16 @@ class MainActivity : ComponentActivity() {
             androidx.preference.PreferenceManager
                 .getDefaultSharedPreferences(applicationContext)
         )
+
+        val fineGranted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        if (fineGranted) {
+            LocationController.refresh(applicationContext)
+        } else {
+            locationPermLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+
         setContent {
             SkySpyTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
