@@ -31,7 +31,7 @@ fun AppRoot(vm: SkySpyViewModel) {
     val drones by vm.drones.collectAsState()
     val console by vm.console.collectAsState()
     val connected by vm.connected.collectAsState()
-    val mapView = rememberSkyMapView()
+    var mapCamera by remember { mutableStateOf<MapCamera?>(null) }
 
     Scaffold(
         topBar = {
@@ -70,7 +70,12 @@ fun AppRoot(vm: SkySpyViewModel) {
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
             when (tab) {
-                0 -> MapScreen(mapView, drones, Modifier.fillMaxSize())
+                0 -> MapScreen(
+                    savedCamera = mapCamera,
+                    onCameraChange = { mapCamera = it },
+                    drones = drones,
+                    modifier = Modifier.fillMaxSize()
+                )
                 1 -> ConsoleScreen(console)
                 2 -> SettingsScreen(vm)
             }

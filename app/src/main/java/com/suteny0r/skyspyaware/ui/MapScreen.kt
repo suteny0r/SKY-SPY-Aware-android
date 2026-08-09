@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -27,6 +28,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.graphics.drawable.toDrawable
 import com.suteny0r.skyspyaware.Drone
 import com.suteny0r.skyspyaware.LocationController
+import org.osmdroid.events.MapListener
+import org.osmdroid.events.ScrollEvent
+import org.osmdroid.events.ZoomEvent
 import org.osmdroid.tileprovider.tilesource.XYTileSource
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.views.CustomZoomButtonsController
@@ -35,6 +39,9 @@ import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
 
 private const val INITIAL_ZOOM = 14.0
+
+/** Snapshot of the map camera, saved across tab switches. */
+data class MapCamera(val lat: Double, val lon: Double, val zoom: Double)
 
 // ESRI World Imagery satellite tiles - free, no API key required.
 private val ESRI_SAT = XYTileSource(
@@ -77,44 +84,69 @@ private object IconCache {
     }
 }
 
-/**
- * Creates the map once (hoisted at app level) so camera position and zoom
- * survive tab switches. Only recreated if the context changes.
- */
-@Composable
-fun rememberSkyMapView(): MapView {
-    val context = LocalContext.current
-    return remember(context) {
-        MapView(context).apply {
-            setTileSource(ESRI_SAT)
-            setMultiTouchControls(true)
-            zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
-            controller.setZoom(INITIAL_ZOOM)
-        }
-    }
-}
-
 @Composable
 fun MapScreen(
-    mapView: MapView,
+    savedCamera: MapCamera?,
+    onCameraChange: (MapCamera) -> Unit,
     drones: List<Drone>,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+
+    // Fresh MapView per tab visit - reusing a detached osmdroid MapView
+    // crashes (overlay repository goes null). Camera is restored from
+    // [savedCamera] instead.
+    val mapView = remember(context) {
+        MapView(context).apply {
+            setTileSource(ESRI_SAT)
+            setMultiTouchControls(true)
+            zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
+        }
+    }
+
     val droneMarkers = remember { LinkedHashMap<String, Marker>() }
     val pilotMarkers = remember { LinkedHashMap<String, Marker>() }
     val lines = remember { LinkedHashMap<String, Polyline>() }
-    val centered = remember { mutableStateOf(false) }
     val myLocation by LocationController.location.collectAsState()
+    var userMoved by remember { mutableStateOf(false) }
 
-    // Center on the device location once, at ~5km range.
-    LaunchedEffect(myLocation) {
-        val loc = myLocation
-        if (loc != null && !centered.value) {
-            mapView.controller.setCenter(loc)
-            mapView.controller.setZoom(INITIAL_ZOOM)
-            centered.value = true
+    fun saveCamera() {
+        val c = mapView.mapCenter
+        onCameraChange(MapCamera(c.latitude, c.longitude, mapView.zoomLevelDouble))
+    }
+
+    // Restore the saved camera once on attach.
+    LaunchedEffect(Unit) {
+        if (savedCamera != null) {
+            mapView.controller.setZoom(savedCamera.zoom)
+            mapView.controller.setCenter(GeoPoint(savedCamera.lat, savedCamera.lon))
         }
+    }
+
+    // Center on the device location only if no saved camera and user hasn't panned.
+    LaunchedEffect(myLocation) {
+        if (savedCamera == null && !userMoved && myLocation != null) {
+            mapView.controller.setCenter(myLocation!!)
+            mapView.controller.setZoom(INITIAL_ZOOM)
+        }
+    }
+
+    // Track camera changes and tear down the map properly when leaving the tab.
+    DisposableEffect(Unit) {
+        mapView.addMapListener(object : MapListener {
+            override fun onScroll(event: ScrollEvent): Boolean {
+                userMoved = true
+                saveCamera()
+                return false
+            }
+
+            override fun onZoom(event: ZoomEvent): Boolean {
+                userMoved = true
+                saveCamera()
+                return false
+            }
+        })
+        onDispose { mapView.onDetach() }
     }
 
     Box(modifier) {
@@ -175,6 +207,7 @@ fun MapScreen(
                 LocationController.refresh(context)
                 LocationController.location.value?.let {
                     mapView.controller.setCenter(it)
+                    saveCamera()
                 }
             },
             modifier = Modifier
