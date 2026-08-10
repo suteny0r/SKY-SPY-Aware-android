@@ -11,7 +11,9 @@ import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
 import org.eclipse.paho.client.mqttv3.MqttCallback
 import org.eclipse.paho.client.mqttv3.MqttClient
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions
+import org.eclipse.paho.client.mqttv3.MqttException
 import org.eclipse.paho.client.mqttv3.MqttMessage
+import org.eclipse.paho.client.mqttv3.MqttSecurityException
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import java.net.URI
 import java.util.concurrent.atomic.AtomicBoolean
@@ -101,7 +103,20 @@ class MqttManager(private val context: Context) {
                 onStatus?.invoke("Connected to ${settings.broker}:${settings.port} | subscribed $rawTopic")
             } catch (e: Exception) {
                 connectedFlag.set(false)
-                if (enabled.get()) onStatus?.invoke("Reconnect failed: ${e.message}; retrying")
+                runCatching { this@MqttManager.client?.disconnect() }
+                if (enabled.get()) {
+                    if (isTransient(e)) {
+                        // Network unreachable, timeouts, broker temporarily
+                        // unavailable: keep retrying via the watchdog.
+                        onStatus?.invoke("Connection unavailable: ${e.message}; retrying")
+                    } else {
+                        // Broker actively rejected us (bad credentials, not
+                        // authorized, bad protocol/client id): retrying won't
+                        // help, so stop. User can reconnect from Settings.
+                        enabled.set(false)
+                        onStatus?.invoke("Server rejected connection: ${e.message} (not retrying)")
+                    }
+                }
             } finally {
                 connecting.set(false)
             }
@@ -120,6 +135,31 @@ class MqttManager(private val context: Context) {
     }
 
     fun isConnected(): Boolean = connectedFlag.get()
+
+    /**
+     * True if a connect failure is worth retrying. Network-level problems
+     * (unreachable host, timeouts, SSL, server temporarily unavailable) are
+     * transient. A broker that actively rejects the connection (bad user or
+     * password, not authorized, unacceptable protocol version, rejected
+     * client id) will keep failing, so we stop retrying instead.
+     */
+    private fun isTransient(e: Throwable): Boolean {
+        // Broker-side rejections surface as MqttSecurityException or an
+        // MqttException with the CONNACK reason code.
+        if (e is MqttSecurityException) return false
+        if (e is MqttException) {
+            when (e.reasonCode) {
+                MqttException.REASON_CODE_INVALID_PROTOCOL_VERSION.toInt(),
+                MqttException.REASON_CODE_INVALID_CLIENT_ID.toInt(),
+                MqttException.REASON_CODE_FAILED_AUTHENTICATION.toInt(),
+                MqttException.REASON_CODE_NOT_AUTHORIZED.toInt(),
+                MqttException.REASON_CODE_SUBSCRIBE_FAILED.toInt() -> return false
+            }
+        }
+        // Everything else (timeouts, unreachable, DNS, SSL, server
+        // unavailable, connection lost) is transient.
+        return true
+    }
 
     companion object {
         private const val WATCHDOG_MS = 8000L

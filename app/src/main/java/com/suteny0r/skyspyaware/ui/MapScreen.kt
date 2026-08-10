@@ -17,7 +17,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.MyLocation
-import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
@@ -414,7 +413,7 @@ fun MapScreen(
             Icon(Icons.Filled.Layers, contentDescription = "Change map style")
         }
 
-        FloatingActionButton(
+        SmallFloatingActionButton(
             onClick = {
                 LocationController.refresh(context)
                 LocationController.location.value?.let {
@@ -423,8 +422,8 @@ fun MapScreen(
                 }
             },
             modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(16.dp)
+                .align(Alignment.TopEnd)
+                .padding(top = 72.dp, end = 16.dp)
         ) {
             Icon(Icons.Filled.MyLocation, contentDescription = "Center on my location")
         }
@@ -433,7 +432,7 @@ fun MapScreen(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(start = 16.dp, end = 16.dp, bottom = 88.dp),
+                .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
             shape = MaterialTheme.shapes.medium,
             tonalElevation = 3.dp,
             shadowElevation = 2.dp
