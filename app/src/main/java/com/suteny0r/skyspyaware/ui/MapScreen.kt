@@ -260,6 +260,7 @@ fun MapScreen(
     val pilotMarkers = remember { LinkedHashMap<String, Marker>() }
     val lines = remember { LinkedHashMap<String, Polyline>() }
     val trailLines = remember { LinkedHashMap<String, Polyline>() }
+    val trailCores = remember { LinkedHashMap<String, Polyline>() }
     val droneIconKeys = remember { HashMap<String, String>() }
     val pilotIconKeys = remember { HashMap<String, Boolean>() }
     val myLocation by LocationController.location.collectAsState()
@@ -326,6 +327,7 @@ fun MapScreen(
                 pilotMarkers.remove(key)?.let { mapView.overlays.remove(it) }
                 lines.remove(key)?.let { mapView.overlays.remove(it) }
                 trailLines.remove(key)?.let { mapView.overlays.remove(it) }
+                trailCores.remove(key)?.let { mapView.overlays.remove(it) }
                 droneIconKeys.remove(key)
                 pilotIconKeys.remove(key)
             }
@@ -333,18 +335,30 @@ fun MapScreen(
             for (d in drones) {
                 val stale = nowMs - d.lastSeen > STALE_MS
 
-                val trailLine = trailLines.getOrPut(d.key) {
+                // Thick white track with a dark casing (two stacked polylines)
+                // so it reads clearly on every base map and stays distinct
+                // from the cyan drone-pilot connector lines. Stroke widths are
+                // density-scaled because osmdroid draws in raw pixels.
+                val density = context.resources.displayMetrics.density
+                val casing = trailLines.getOrPut(d.key) {
                     Polyline(mapView).apply {
-                        paint.color = 0x6600BCD4.toInt()
-                        paint.strokeWidth = 3f
+                        paint.color = 0xE6000000.toInt()
+                        paint.strokeWidth = 5f * density
+                        paint.strokeCap = Paint.Cap.ROUND
                         mapView.overlays.add(this)
                     }
                 }
-                if (d.trail.size >= 2) {
-                    trailLine.setPoints(d.trail.map { GeoPoint(it.lat, it.lon) })
-                } else {
-                    trailLine.setPoints(emptyList())
+                val core = trailCores.getOrPut(d.key) {
+                    Polyline(mapView).apply {
+                        paint.color = 0xFFFFFFFF.toInt()
+                        paint.strokeWidth = 3f * density
+                        paint.strokeCap = Paint.Cap.ROUND
+                        mapView.overlays.add(this)
+                    }
                 }
+                val trailPts = d.trail.map { GeoPoint(it.lat, it.lon) }
+                casing.setPoints(trailPts)
+                core.setPoints(trailPts)
 
                 val dm = droneMarkers.getOrPut(d.key) {
                     Marker(mapView).apply {
