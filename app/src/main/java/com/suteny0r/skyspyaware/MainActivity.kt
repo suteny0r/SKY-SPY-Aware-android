@@ -2,6 +2,7 @@ package com.suteny0r.skyspyaware
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -24,6 +25,9 @@ class MainActivity : ComponentActivity() {
             if (granted) LocationController.refresh(applicationContext)
         }
 
+    private val notifPermLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -42,6 +46,15 @@ class MainActivity : ComponentActivity() {
             LocationController.refresh(applicationContext)
         } else {
             locationPermLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+
+        // Needed on Android 13+ for the foreground "collecting" notification
+        // and new-drone alerts.
+        if (Build.VERSION.SDK_INT >= 33) {
+            val notifGranted = ContextCompat.checkSelfPermission(
+                this, Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!notifGranted) notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
         setContent {

@@ -55,6 +55,13 @@ class SettingsRepository(context: Context) {
         prefs.edit().putInt("historyMinutes", minutes).apply()
     }
 
+    /** Whether background MQTT collection is wanted (defaults to on). */
+    fun getCollectingEnabled(): Boolean = prefs.getBoolean("collectingEnabled", true)
+
+    fun setCollectingEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("collectingEnabled", enabled).apply()
+    }
+
     companion object {
         const val DEFAULT_HISTORY_MINUTES = 30
         const val DEFAULT_BROKER = "65604cba457d4f8992aefe5820219ae4.s1.eu.hivemq.cloud"
