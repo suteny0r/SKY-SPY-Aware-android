@@ -52,7 +52,6 @@ import org.osmdroid.events.ZoomEvent
 import org.osmdroid.tileprovider.tilesource.ITileSource
 import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
-import org.osmdroid.tileprovider.tilesource.XYTileSource
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.CustomZoomButtonsController
@@ -87,14 +86,9 @@ val ESRI_SAT = EsriSatelliteTileSource()
 /** Selectable base map styles. */
 val MAP_STYLES: List<ITileSource> = listOf(
     ESRI_SAT,
-    TileSourceFactory.MAPNIK,
-    XYTileSource(
-        "CARTO_Dark",
-        0, 19, 256, ".png",
-        arrayOf("https://basemaps.cartocdn.com/dark_all")
-    )
+    TileSourceFactory.MAPNIK
 )
-val MAP_STYLE_NAMES = listOf("Satellite", "Street", "Dark")
+val MAP_STYLE_NAMES = listOf("Satellite", "Street")
 
 private fun altitudeBand(alt: Int): String = when {
     alt < 0 -> "u"
