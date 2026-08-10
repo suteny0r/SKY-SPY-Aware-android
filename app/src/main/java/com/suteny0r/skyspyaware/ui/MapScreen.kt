@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -18,6 +19,7 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SmallFloatingActionButton
@@ -33,6 +35,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Fill
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -221,6 +228,39 @@ private fun historyLabel(mins: Int): String = when {
     mins < 60 -> "${mins}m"
     mins % 60 == 0 -> "${mins / 60}h"
     else -> "${mins / 60}h ${mins % 60}m"
+}
+
+/** Quadcopter glyph for the "center on activity" button. */
+@Composable
+private fun DroneGlyph(modifier: Modifier) {
+    val color = LocalContentColor.current
+    Canvas(modifier) {
+        val c = size.minDimension / 2f
+        val u = size.minDimension / 2f
+        drawLine(
+            color, Offset(c - 0.34f * u, c - 0.34f * u), Offset(c, c),
+            strokeWidth = 0.11f * u, cap = StrokeCap.Round
+        )
+        drawLine(
+            color, Offset(c + 0.34f * u, c - 0.34f * u), Offset(c, c),
+            strokeWidth = 0.11f * u, cap = StrokeCap.Round
+        )
+        drawLine(
+            color, Offset(c - 0.34f * u, c + 0.34f * u), Offset(c, c),
+            strokeWidth = 0.11f * u, cap = StrokeCap.Round
+        )
+        drawLine(
+            color, Offset(c + 0.34f * u, c + 0.34f * u), Offset(c, c),
+            strokeWidth = 0.11f * u, cap = StrokeCap.Round
+        )
+        val rr = 0.15f * u
+        val rotor = Stroke(width = 0.08f * u)
+        drawCircle(color, radius = rr, center = Offset(c - 0.34f * u, c - 0.34f * u), style = rotor)
+        drawCircle(color, radius = rr, center = Offset(c + 0.34f * u, c - 0.34f * u), style = rotor)
+        drawCircle(color, radius = rr, center = Offset(c - 0.34f * u, c + 0.34f * u), style = rotor)
+        drawCircle(color, radius = rr, center = Offset(c + 0.34f * u, c + 0.34f * u), style = rotor)
+        drawCircle(color, radius = 0.11f * u, center = Offset(c, c), style = Fill)
+    }
 }
 
 @Composable
@@ -440,6 +480,24 @@ fun MapScreen(
                 .padding(top = 72.dp, end = 16.dp)
         ) {
             Icon(Icons.Filled.MyLocation, contentDescription = "Center on my location")
+        }
+
+        // Center on the most recently detected activity (drone). Dimmed and
+        // inert when nothing has been detected in the current window.
+        SmallFloatingActionButton(
+            onClick = {
+                drones.maxByOrNull { it.lastSeen }?.let {
+                    mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
+                    userMoved = true
+                    saveCamera()
+                }
+            },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = 128.dp, end = 16.dp)
+                .alpha(if (drones.isNotEmpty()) 1f else 0.4f)
+        ) {
+            DroneGlyph(Modifier.size(24.dp))
         }
 
         Surface(
