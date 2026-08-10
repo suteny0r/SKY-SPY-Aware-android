@@ -5,15 +5,25 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.RectF
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
 import androidx.compose.material3.SmallFloatingActionButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -30,6 +40,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.graphics.drawable.toDrawable
 import com.suteny0r.skyspyaware.Drone
 import com.suteny0r.skyspyaware.LocationController
+import com.suteny0r.skyspyaware.MAX_HISTORY_MINUTES
 import org.osmdroid.events.MapListener
 import org.osmdroid.events.ScrollEvent
 import org.osmdroid.events.ZoomEvent
@@ -45,6 +56,7 @@ import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
 
 private const val INITIAL_ZOOM = 14.0
+private const val STALE_MS = 30_000L
 
 /** Snapshot of the map camera, saved across tab switches. */
 data class MapCamera(val lat: Double, val lon: Double, val zoom: Double)
@@ -79,36 +91,137 @@ val MAP_STYLES: List<ITileSource> = listOf(
 )
 val MAP_STYLE_NAMES = listOf("Satellite", "Street", "Dark")
 
+private fun altitudeBand(alt: Int): String = when {
+    alt < 0 -> "u"
+    alt < 50 -> "g"
+    alt < 150 -> "y"
+    alt < 400 -> "o"
+    else -> "r"
+}
+
+private fun altitudeColor(alt: Int): Int = when {
+    alt < 0 -> 0xFFCE93D8.toInt()          // underground/negative
+    alt < 50 -> 0xFF00C853.toInt()         // green
+    alt < 150 -> 0xFFFFEB3B.toInt()        // yellow
+    alt < 400 -> 0xFFFF9800.toInt()        // orange
+    else -> 0xFFF44336.toInt()             // red
+}
+
+/**
+ * Larger, higher-contrast map icons. Drone: colored altitude badge with a
+ * quadcopter glyph. Pilot: cyan badge with a person glyph. Both are sized in
+ * dp so they render consistently across screen densities. Stale drones (no
+ * update in [STALE_MS]) render dimmed.
+ */
 private object IconCache {
-    fun drone(altitude: Int): Bitmap =
-        circle(altitudeColor(altitude), 24, 10)
+    private val bitmaps = HashMap<String, Bitmap>()
 
-    fun pilot(): Bitmap =
-        circle(0xCC00BCD4.toInt(), 20, 8)
-
-    private fun altitudeColor(alt: Int): Int = when {
-        alt < 0 -> 0xFFCE93D8.toInt()          // underground/negative
-        alt < 50 -> 0xFF00C853.toInt()         // green
-        alt < 150 -> 0xFFFFEB3B.toInt()        // yellow
-        alt < 400 -> 0xFFFF9800.toInt()        // orange
-        else -> 0xFFF44336.toInt()             // red
+    fun drone(ctx: Context, altitude: Int, stale: Boolean): Bitmap {
+        val key = (if (stale) "s:" else "") + altitudeBand(altitude) + ":" +
+            ctx.resources.displayMetrics.density
+        return bitmaps.getOrPut(key) {
+            drawBadge(ctx, altitudeColor(altitude), stale, 38f) { c, s, p ->
+                drawDroneGlyph(c, s, p)
+            }
+        }
     }
 
-    private fun circle(color: Int, size: Int, radius: Int): Bitmap {
-        val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            this.color = color
+    fun pilot(ctx: Context, stale: Boolean): Bitmap {
+        val key = (if (stale) "ps:" else "p:") + ctx.resources.displayMetrics.density
+        return bitmaps.getOrPut(key) {
+            drawBadge(ctx, 0xFF00BCD4.toInt(), stale, 32f) { c, s, p ->
+                drawPilotGlyph(c, s, p)
+            }
         }
-        canvas.drawCircle(size / 2f, size / 2f, radius.toFloat(), p)
-        val border = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    }
+
+    private fun drawBadge(
+        ctx: Context, color: Int, stale: Boolean, sizeDp: Float,
+        glyph: (Canvas, Float, Paint) -> Unit
+    ): Bitmap {
+        val density = ctx.resources.displayMetrics.density
+        val px = (sizeDp * density).toInt().coerceAtLeast(24)
+        val s = px.toFloat()
+        val c = s / 2f
+        val r = c - 2f
+        val alpha = if (stale) 96 else 255
+
+        val bmp = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+
+        val shadow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = 0x66000000.toInt()
+        }
+        canvas.drawCircle(c + s * 0.03f, c + s * 0.04f, r, shadow)
+
+        val disc = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            this.alpha = alpha
+        }
+        canvas.drawCircle(c, c, r, disc)
+
+        val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = Color.WHITE
             style = Paint.Style.STROKE
-            strokeWidth = 3f
+            strokeWidth = if (stale) 2.5f * density else 3.5f * density
+            this.alpha = alpha
         }
-        canvas.drawCircle(size / 2f, size / 2f, radius.toFloat() - 1.5f, border)
+        canvas.drawCircle(c, c, r - ring.strokeWidth / 2f, ring)
+
+        val glyphPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = Color.WHITE
+            this.alpha = alpha
+        }
+        glyph(canvas, s, glyphPaint)
         return bmp
     }
+
+    /** Quadcopter viewed from above: hub, four arms, four rotors. */
+    private fun drawDroneGlyph(canvas: Canvas, s: Float, p: Paint) {
+        val c = s / 2f
+        val u = s / 2f
+        val arm = Paint(p).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 0.11f * u
+            strokeCap = Paint.Cap.ROUND
+        }
+        canvas.drawLine(c - 0.34f * u, c - 0.34f * u, c, c, arm)
+        canvas.drawLine(c + 0.34f * u, c - 0.34f * u, c, c, arm)
+        canvas.drawLine(c - 0.34f * u, c + 0.34f * u, c, c, arm)
+        canvas.drawLine(c + 0.34f * u, c + 0.34f * u, c, c, arm)
+
+        val rotor = Paint(p).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 0.08f * u
+        }
+        val rr = 0.15f * u
+        canvas.drawCircle(c - 0.34f * u, c - 0.34f * u, rr, rotor)
+        canvas.drawCircle(c + 0.34f * u, c - 0.34f * u, rr, rotor)
+        canvas.drawCircle(c - 0.34f * u, c + 0.34f * u, rr, rotor)
+        canvas.drawCircle(c + 0.34f * u, c + 0.34f * u, rr, rotor)
+
+        canvas.drawCircle(c, c, 0.11f * u, Paint(p).apply { style = Paint.Style.FILL })
+    }
+
+    /** Person silhouette: head + shoulders. */
+    private fun drawPilotGlyph(canvas: Canvas, s: Float, p: Paint) {
+        val c = s / 2f
+        val u = s / 2f
+        val fill = Paint(p).apply { style = Paint.Style.FILL }
+        canvas.drawCircle(c, c - 0.22f * u, 0.15f * u, fill)
+        val rect = RectF(
+            c - 0.30f * u, c - 0.02f * u,
+            c + 0.30f * u, c + 0.48f * u
+        )
+        canvas.drawArc(rect, 180f, 180f, true, fill)
+    }
+}
+
+private fun historyLabel(mins: Int): String = when {
+    mins <= 0 -> "live only"
+    mins < 60 -> "${mins}m"
+    mins % 60 == 0 -> "${mins / 60}h"
+    else -> "${mins / 60}h ${mins % 60}m"
 }
 
 @Composable
@@ -121,6 +234,8 @@ fun MapScreen(
     onDroneSelected: (String) -> Unit,
     focusKey: String?,
     focusTick: Int,
+    historyMinutes: Int,
+    onHistoryChange: (Int) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -142,19 +257,12 @@ fun MapScreen(
         mapView.setTileSource(MAP_STYLES[mapStyle.coerceIn(0, MAP_STYLES.lastIndex)])
     }
 
-    // Center on a drone when the user requests it (list tap / marker tap).
-    LaunchedEffect(focusTick) {
-        if (focusKey != null) {
-            drones.firstOrNull { it.key == focusKey }?.let {
-                mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
-            }
-        }
-    }
-
     val droneMarkers = remember { LinkedHashMap<String, Marker>() }
     val pilotMarkers = remember { LinkedHashMap<String, Marker>() }
     val lines = remember { LinkedHashMap<String, Polyline>() }
     val trailLines = remember { LinkedHashMap<String, Polyline>() }
+    val droneIconKeys = remember { HashMap<String, String>() }
+    val pilotIconKeys = remember { HashMap<String, Boolean>() }
     val myLocation by LocationController.location.collectAsState()
     var userMoved by remember { mutableStateOf(false) }
 
@@ -171,11 +279,24 @@ fun MapScreen(
         }
     }
 
-    // Center on the device location only if no saved camera and user hasn't panned.
+    // Center on the device location only if no saved camera and the user
+    // hasn't panned or requested a specific drone.
     LaunchedEffect(myLocation) {
-        if (savedCamera == null && !userMoved && myLocation != null) {
+        if (savedCamera == null && focusKey == null && !userMoved && myLocation != null) {
             mapView.controller.setCenter(myLocation!!)
             mapView.controller.setZoom(INITIAL_ZOOM)
+        }
+    }
+
+    // Center on a drone when the user requests it (list tap / marker tap).
+    // Runs after the camera-restore and my-location effects so it wins, and
+    // marks the map as user-moved so the device location never fights it.
+    LaunchedEffect(focusTick) {
+        if (focusKey != null) {
+            drones.firstOrNull { it.key == focusKey }?.let {
+                mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
+                userMoved = true
+            }
         }
     }
 
@@ -199,15 +320,20 @@ fun MapScreen(
 
     Box(modifier) {
         AndroidView(factory = { mapView }, modifier = Modifier.fillMaxSize()) { _ ->
+            val nowMs = System.currentTimeMillis()
             val keys = drones.map { it.key }
             (droneMarkers.keys - keys).forEach { key ->
                 droneMarkers.remove(key)?.let { mapView.overlays.remove(it) }
                 pilotMarkers.remove(key)?.let { mapView.overlays.remove(it) }
                 lines.remove(key)?.let { mapView.overlays.remove(it) }
                 trailLines.remove(key)?.let { mapView.overlays.remove(it) }
+                droneIconKeys.remove(key)
+                pilotIconKeys.remove(key)
             }
 
             for (d in drones) {
+                val stale = nowMs - d.lastSeen > STALE_MS
+
                 val trailLine = trailLines.getOrPut(d.key) {
                     Polyline(mapView).apply {
                         paint.color = 0x6600BCD4.toInt()
@@ -215,12 +341,14 @@ fun MapScreen(
                         mapView.overlays.add(this)
                     }
                 }
-                trailLine.setPoints(d.trail.map { GeoPoint(it.first, it.second) })
+                if (d.trail.size >= 2) {
+                    trailLine.setPoints(d.trail.map { GeoPoint(it.lat, it.lon) })
+                } else {
+                    trailLine.setPoints(emptyList())
+                }
 
                 val dm = droneMarkers.getOrPut(d.key) {
                     Marker(mapView).apply {
-                        icon = IconCache.drone(d.droneAltitude)
-                            .toDrawable(context.resources)
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                         setOnMarkerClickListener { _, _ ->
                             onDroneSelected(d.key)
@@ -229,6 +357,12 @@ fun MapScreen(
                         mapView.overlays.add(this)
                     }
                 }
+                val iconKey = if (stale) "s" else altitudeBand(d.droneAltitude)
+                if (droneIconKeys[d.key] != iconKey) {
+                    droneIconKeys[d.key] = iconKey
+                    dm.icon = IconCache.drone(context, d.droneAltitude, stale)
+                        .toDrawable(context.resources)
+                }
                 dm.position = GeoPoint(d.droneLat, d.droneLon)
                 dm.title = d.basicId.ifBlank { d.mac }
                 dm.snippet = "alt ${d.droneAltitude}m  RSSI ${d.rssi}  MAC ${d.mac}"
@@ -236,11 +370,15 @@ fun MapScreen(
                 if (d.pilotLat != 0.0 || d.pilotLon != 0.0) {
                     val pm = pilotMarkers.getOrPut(d.key) {
                         Marker(mapView).apply {
-                            icon = IconCache.pilot().toDrawable(context.resources)
                             setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                             title = "Pilot"
                             mapView.overlays.add(this)
                         }
+                    }
+                    if (pilotIconKeys[d.key] != stale) {
+                        pilotIconKeys[d.key] = stale
+                        pm.icon = IconCache.pilot(context, stale)
+                            .toDrawable(context.resources)
                     }
                     pm.position = GeoPoint(d.pilotLat, d.pilotLon)
                     val line = lines.getOrPut(d.key) {
@@ -259,6 +397,7 @@ fun MapScreen(
                 } else {
                     pilotMarkers.remove(d.key)?.let { mapView.overlays.remove(it) }
                     lines.remove(d.key)?.let { mapView.overlays.remove(it) }
+                    pilotIconKeys.remove(d.key)
                 }
             }
             mapView.invalidate()
@@ -288,6 +427,39 @@ fun MapScreen(
                 .padding(16.dp)
         ) {
             Icon(Icons.Filled.MyLocation, contentDescription = "Center on my location")
+        }
+
+        Surface(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .padding(start = 16.dp, end = 16.dp, bottom = 88.dp),
+            shape = MaterialTheme.shapes.medium,
+            tonalElevation = 3.dp,
+            shadowElevation = 2.dp
+        ) {
+            Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Filled.History,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "  History: ${historyLabel(historyMinutes)}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Slider(
+                    value = historyMinutes.toFloat(),
+                    onValueChange = {
+                        onHistoryChange(it.toInt().coerceIn(0, MAX_HISTORY_MINUTES))
+                    },
+                    valueRange = 0f..MAX_HISTORY_MINUTES.toFloat()
+                )
+            }
         }
     }
 }

@@ -14,14 +14,16 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-private const val DRONE_TIMEOUT_MS = 60_000L
+private const val DRONE_RETENTION_MS = DetectionCache.RETAIN_MS
 private const val CONSOLE_LIMIT = 500
-private const val TRAIL_MAX = 60
+private const val TRAIL_MAX = 500
+const val MAX_HISTORY_MINUTES = 1440
 
 class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
 
     private val settingsRepo = SettingsRepository(app)
     private val mqtt = MqttManager(app.applicationContext)
+    private val cache: DetectionCache by lazy { DetectionCache(app) }
 
     private val _drones = MutableStateFlow<List<Drone>>(emptyList())
     val drones: StateFlow<List<Drone>> = _drones.asStateFlow()
@@ -38,6 +40,9 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
     private val _faa = MutableStateFlow<Map<String, String>>(emptyMap())
     val faa: StateFlow<Map<String, String>> = _faa.asStateFlow()
 
+    private val _historyMinutes = MutableStateFlow(settingsRepo.getHistoryMinutes())
+    val historyMinutes: StateFlow<Int> = _historyMinutes.asStateFlow()
+
     private val droneMap = LinkedHashMap<String, Drone>()
     private val consoleBuffer = ArrayDeque<String>()
     private val faaCache = HashMap<String, String>()
@@ -45,6 +50,7 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
     private val ageScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var ageJob: Job? = null
     private val faaScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cacheScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
         mqtt.onLine = { line -> handleLine(line) }
@@ -54,6 +60,7 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
                 ageOut()
             }
         }
+        loadCachedHistory()
         // Auto-connect to the stored broker on startup.
         connect()
     }
@@ -66,9 +73,21 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
         }
         val d = DetectionParser.parse(line) ?: return
         val now = System.currentTimeMillis()
+        try {
+            cache.insert(d, now)
+        } catch (_: Exception) {
+        }
+        updateDrone(d, now, faa = true)
+        _drones.value = droneMap.values.toList()
+    }
+
+    /** Rebuild drone state from a detection. [ts] is the arrival timestamp. */
+    private fun updateDrone(d: Detection, ts: Long, faa: Boolean) {
         val key = d.basicId.ifBlank { d.mac }
         synchronized(droneMap) {
             val prev = droneMap[key]
+            // Skip older frames (e.g. history replay racing a live update).
+            if (prev != null && ts < prev.lastSeen) return
             val macPositions = (prev?.macPositions ?: emptyMap()).toMutableMap()
             val lastForMac = macPositions[d.mac]
             // A drone can broadcast on multiple MACs (AP beacon vs NAN) with
@@ -81,10 +100,10 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
             val effectiveLat = if (macChanged) d.droneLat else (prev?.droneLat ?: d.droneLat)
             val effectiveLon = if (macChanged) d.droneLon else (prev?.droneLon ?: d.droneLon)
             val trail = if (macChanged) {
-                ((prev?.trail ?: emptyList()) + (effectiveLat to effectiveLon))
+                ((prev?.trail ?: emptyList()) + TrailPoint(ts, effectiveLat, effectiveLon))
                     .takeLast(TRAIL_MAX)
             } else {
-                prev?.trail ?: listOf(effectiveLat to effectiveLon)
+                prev?.trail ?: listOf(TrailPoint(ts, effectiveLat, effectiveLon))
             }
 
             droneMap[key] = Drone(
@@ -97,14 +116,28 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
                 pilotLat = d.pilotLat,
                 pilotLon = d.pilotLon,
                 basicId = d.basicId,
-                lastSeen = now,
+                lastSeen = ts,
                 detections = (prev?.detections ?: 0) + 1,
                 macPositions = macPositions,
                 trail = trail
             )
+        }
+        if (faa && d.basicId.isNotBlank()) faaLookup(d.basicId)
+    }
+
+    /** Rebuild drone state from the last 24h of cached detections on startup. */
+    private fun loadCachedHistory() {
+        cacheScope.launch {
+            val now = System.currentTimeMillis()
+            try {
+                cache.prune(now - DRONE_RETENTION_MS)
+                val rows = cache.loadSince(now - DRONE_RETENTION_MS)
+                rows.forEach { updateDrone(it.toDetection(), it.ts, faa = true) }
+            } catch (_: Exception) {
+                // Cache failures must not block live operation.
+            }
             _drones.value = droneMap.values.toList()
         }
-        if (d.basicId.isNotBlank()) faaLookup(d.basicId)
     }
 
     private fun faaLookup(basicId: String) {
@@ -125,13 +158,24 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun ageOut() {
         val now = System.currentTimeMillis()
+        var changed = false
         synchronized(droneMap) {
             val it = droneMap.entries.iterator()
             while (it.hasNext()) {
-                if (now - it.next().value.lastSeen > DRONE_TIMEOUT_MS) it.remove()
+                if (now - it.next().value.lastSeen > DRONE_RETENTION_MS) {
+                    it.remove()
+                    changed = true
+                }
             }
-            _drones.value = droneMap.values.toList()
         }
+        if (changed) {
+            try {
+                cache.prune(now - DRONE_RETENTION_MS)
+            } catch (_: Exception) {
+            }
+        }
+        // Always emit so the UI's history window re-evaluates on a timer.
+        _drones.value = droneMap.values.toList()
     }
 
     fun connect() {
@@ -154,11 +198,18 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
     fun getMapStyle(): Int = settingsRepo.getMapStyle()
     fun setMapStyle(index: Int) = settingsRepo.setMapStyle(index)
 
+    fun setHistoryMinutes(minutes: Int) {
+        val v = minutes.coerceIn(0, MAX_HISTORY_MINUTES)
+        _historyMinutes.value = v
+        settingsRepo.setHistoryMinutes(v)
+    }
+
     override fun onCleared() {
         mqtt.disconnect()
         ageJob?.cancel()
         ageScope.cancel()
         faaScope.cancel()
+        cacheScope.cancel()
         super.onCleared()
     }
 }

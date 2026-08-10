@@ -39,6 +39,9 @@ object DetectionParser {
     }
 }
 
+/** A timestamped position point for trail/history rendering. */
+data class TrailPoint(val ts: Long, val lat: Double, val lon: Double)
+
 /** Current state of a tracked drone. */
 data class Drone(
     val key: String,
@@ -54,6 +57,6 @@ data class Drone(
     val detections: Int,
     /** Per-MAC last-reported position, to ignore stale beacon frames. */
     val macPositions: Map<String, Pair<Double, Double>> = emptyMap(),
-    /** Position history (newest last) for the flight-path trail. */
-    val trail: List<Pair<Double, Double>> = emptyList()
+    /** Timestamped position history (newest last) for trails/history. */
+    val trail: List<TrailPoint> = emptyList()
 )

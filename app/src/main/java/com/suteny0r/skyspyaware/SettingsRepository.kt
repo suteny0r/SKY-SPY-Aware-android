@@ -48,7 +48,15 @@ class SettingsRepository(context: Context) {
         prefs.edit().putInt("mapStyle", index).apply()
     }
 
+    /** History window shown on the map, in minutes (0 = live only). */
+    fun getHistoryMinutes(): Int = prefs.getInt("historyMinutes", DEFAULT_HISTORY_MINUTES)
+
+    fun setHistoryMinutes(minutes: Int) {
+        prefs.edit().putInt("historyMinutes", minutes).apply()
+    }
+
     companion object {
+        const val DEFAULT_HISTORY_MINUTES = 30
         const val DEFAULT_BROKER = "65604cba457d4f8992aefe5820219ae4.s1.eu.hivemq.cloud"
         const val DEFAULT_PORT = 8883
         const val DEFAULT_TLS = true

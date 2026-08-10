@@ -43,6 +43,17 @@ fun AppRoot(vm: SkySpyViewModel) {
 
     val selectedDrone = drones.firstOrNull { it.key == selectedKey }
 
+    val historyMinutes by vm.historyMinutes.collectAsState()
+    // Window filter: show only drones seen within the history window and clip
+    // their trails to that window. 0 = live only (~1 min).
+    val cutoffMs = if (historyMinutes <= 0) 60_000L else historyMinutes * 60_000L
+    val cutoff = System.currentTimeMillis() - cutoffMs
+    val visibleDrones = remember(drones, historyMinutes) {
+        drones
+            .filter { it.lastSeen >= cutoff }
+            .map { it.copy(trail = it.trail.filter { p -> p.ts >= cutoff }) }
+    }
+
     fun select(key: String, jumpToMap: Boolean) {
         selectedKey = key
         if (jumpToMap) {
@@ -98,7 +109,7 @@ fun AppRoot(vm: SkySpyViewModel) {
                 0 -> MapScreen(
                     savedCamera = mapCamera,
                     onCameraChange = { mapCamera = it },
-                    drones = drones,
+                    drones = visibleDrones,
                     mapStyle = mapStyle,
                     onStyleChange = {
                         mapStyle = it
@@ -107,9 +118,11 @@ fun AppRoot(vm: SkySpyViewModel) {
                     onDroneSelected = { key -> select(key, jumpToMap = false) },
                     focusKey = focusKey,
                     focusTick = focusTick,
+                    historyMinutes = historyMinutes,
+                    onHistoryChange = { vm.setHistoryMinutes(it) },
                     modifier = Modifier.fillMaxSize()
                 )
-                1 -> ListScreen(drones, onSelect = { key -> select(key, jumpToMap = true) })
+                1 -> ListScreen(visibleDrones, onSelect = { key -> select(key, jumpToMap = true) })
                 2 -> ConsoleScreen(console)
                 3 -> SettingsScreen(vm)
             }
