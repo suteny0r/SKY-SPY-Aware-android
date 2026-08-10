@@ -35,7 +35,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Fill
@@ -482,8 +481,8 @@ fun MapScreen(
             Icon(Icons.Filled.MyLocation, contentDescription = "Center on my location")
         }
 
-        // Center on the most recently detected activity (drone). Dimmed and
-        // inert when nothing has been detected in the current window.
+        // Center on the most recently detected activity (drone). If nothing
+        // has been detected, tapping does nothing.
         SmallFloatingActionButton(
             onClick = {
                 drones.maxByOrNull { it.lastSeen }?.let {
@@ -495,7 +494,6 @@ fun MapScreen(
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .padding(top = 128.dp, end = 16.dp)
-                .alpha(if (drones.isNotEmpty()) 1f else 0.4f)
         ) {
             DroneGlyph(Modifier.size(24.dp))
         }
