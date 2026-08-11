@@ -1,6 +1,7 @@
 package com.suteny0r.skyspyaware
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -28,8 +29,23 @@ class MainActivity : ComponentActivity() {
     private val notifPermLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleDroneKey(intent)
+    }
+
+    /** Route a tapped new-drone notification to select that drone in the UI. */
+    private fun handleDroneKey(intent: Intent?) {
+        intent?.getStringExtra(DataRepo.EXTRA_DRONE_KEY)?.let { key ->
+            DataRepo.selectDroneFromNotification(key)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        handleDroneKey(intent)
 
         // osmdroid requires an explicit User-Agent or tile servers reject the
         // request with HTTP 400 (getUserAgentValue() is null otherwise).

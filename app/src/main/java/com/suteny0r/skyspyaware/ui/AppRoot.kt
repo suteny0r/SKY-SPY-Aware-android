@@ -17,6 +17,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -60,6 +61,16 @@ fun AppRoot(vm: SkySpyViewModel) {
             focusKey = key
             focusTick++
             tab = 0
+        }
+    }
+
+    // When a new-drone notification is tapped, jump to that drone even if it
+    // is no longer actively broadcasting.
+    val pendingSelection by vm.pendingSelection.collectAsState()
+    LaunchedEffect(pendingSelection) {
+        pendingSelection?.let { key ->
+            select(key, jumpToMap = true)
+            vm.consumePendingSelection()
         }
     }
 
@@ -110,6 +121,7 @@ fun AppRoot(vm: SkySpyViewModel) {
                     savedCamera = mapCamera,
                     onCameraChange = { mapCamera = it },
                     drones = visibleDrones,
+                    allDrones = drones,
                     mapStyle = mapStyle,
                     onStyleChange = {
                         mapStyle = it

@@ -38,6 +38,7 @@ object DataRepo {
     const val FOREGROUND_NOTIF_ID = 1
     const val CHANNEL_COLLECTING = "skyspy_collecting"
     const val CHANNEL_DETECTIONS = "skyspy_detections"
+    const val EXTRA_DRONE_KEY = "drone_key"
 
     private lateinit var appContext: Context
 
@@ -62,6 +63,9 @@ object DataRepo {
 
     private val _historyMinutes = MutableStateFlow(30)
     val historyMinutes: StateFlow<Int> = _historyMinutes.asStateFlow()
+
+    private val _pendingSelection = MutableStateFlow<String?>(null)
+    val pendingSelection: StateFlow<String?> = _pendingSelection.asStateFlow()
 
     private val droneMap = LinkedHashMap<String, Drone>()
     private val consoleBuffer = ArrayDeque<String>()
@@ -270,6 +274,15 @@ object DataRepo {
         settingsRepo.setHistoryMinutes(v)
     }
 
+    /** Called when a new-drone notification is tapped. */
+    fun selectDroneFromNotification(key: String?) {
+        _pendingSelection.value = key
+    }
+
+    fun consumePendingSelection() {
+        _pendingSelection.value = null
+    }
+
     // ----- notifications -----
 
     private fun createChannels() {
@@ -321,6 +334,7 @@ object DataRepo {
             appContext, key.hashCode(),
             Intent(appContext, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(EXTRA_DRONE_KEY, key)
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )

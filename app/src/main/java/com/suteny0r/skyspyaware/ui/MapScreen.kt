@@ -261,6 +261,7 @@ fun MapScreen(
     savedCamera: MapCamera?,
     onCameraChange: (MapCamera) -> Unit,
     drones: List<Drone>,
+    allDrones: List<Drone>,
     mapStyle: Int,
     onStyleChange: (Int) -> Unit,
     onDroneSelected: (String) -> Unit,
@@ -321,12 +322,14 @@ fun MapScreen(
         }
     }
 
-    // Center on a drone when the user requests it (list tap / marker tap).
-    // Runs after the camera-restore and my-location effects so it wins, and
-    // marks the map as user-moved so the device location never fights it.
+    // Center on a drone when the user requests it (list tap / marker tap /
+    // notification tap). Uses the full retained set so it centers on the last
+    // known position even if the drone is outside the history window. Runs
+    // after the camera-restore and my-location effects so it wins, and marks
+    // the map as user-moved so the device location never fights it.
     LaunchedEffect(focusTick) {
         if (focusKey != null) {
-            drones.firstOrNull { it.key == focusKey }?.let {
+            allDrones.firstOrNull { it.key == focusKey }?.let {
                 mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
                 userMoved = true
             }
@@ -418,6 +421,10 @@ fun MapScreen(
                         Marker(mapView).apply {
                             setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                             title = "Pilot"
+                            setOnMarkerClickListener { _, _ ->
+                                onDroneSelected(d.key)
+                                true
+                            }
                             mapView.overlays.add(this)
                         }
                     }
@@ -462,10 +469,12 @@ fun MapScreen(
 
         SmallFloatingActionButton(
             onClick = {
-                LocationController.refresh(context)
-                LocationController.location.value?.let {
-                    mapView.controller.setCenter(it)
-                    saveCamera()
+                LocationController.refresh(context) { geo ->
+                    geo?.let {
+                        mapView.controller.setCenter(it)
+                        userMoved = true
+                        saveCamera()
+                    }
                 }
             },
             modifier = Modifier
@@ -475,11 +484,12 @@ fun MapScreen(
             Icon(Icons.Filled.MyLocation, contentDescription = "Center on my location")
         }
 
-        // Center on the most recently detected activity (drone). If nothing
-        // has been detected, tapping does nothing.
+        // Center on the most recently detected activity (drone), using the
+        // last known position even if the drone's heartbeat has stopped. Uses
+        // the full retained set (allDrones), not just the history window.
         SmallFloatingActionButton(
             onClick = {
-                drones.maxByOrNull { it.lastSeen }?.let {
+                allDrones.maxByOrNull { it.lastSeen }?.let {
                     mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
                     userMoved = true
                     saveCamera()

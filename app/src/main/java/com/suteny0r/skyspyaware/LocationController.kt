@@ -12,28 +12,41 @@ import kotlinx.coroutines.flow.StateFlow
 import org.osmdroid.util.GeoPoint
 
 /**
- * Simple device-location holder. Call [refresh] after the location permission
- * is granted; the latest fix is exposed as [location].
+ * Device-location holder. [refresh] never centers on a stale cached fix: if a
+ * fresh fix (under [FRESH_MS]) is available it is used immediately, otherwise a
+ * fresh single update is requested and [onResult] is called when it arrives.
  */
 object LocationController {
+
+    private const val FRESH_MS = 30_000L
 
     private val _location = MutableStateFlow<GeoPoint?>(null)
     val location: StateFlow<GeoPoint?> = _location
 
+    private var pendingCallback: ((GeoPoint?) -> Unit)? = null
+
     @SuppressLint("MissingPermission")
-    fun refresh(context: Context) {
+    fun refresh(context: Context, onResult: ((GeoPoint?) -> Unit)? = null) {
         val lm = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
         val providers = listOf(
             LocationManager.GPS_PROVIDER,
             LocationManager.NETWORK_PROVIDER
         )
-        val last = providers.firstNotNullOfOrNull { provider ->
+
+        // A fix newer than FRESH_MS is fine to use immediately.
+        val recent = providers.firstNotNullOfOrNull { provider ->
             runCatching { lm.getLastKnownLocation(provider) }.getOrNull()
+                ?.takeIf { System.currentTimeMillis() - it.time < FRESH_MS }
         }
-        if (last != null) {
-            _location.value = GeoPoint(last.latitude, last.longitude)
+        if (recent != null) {
+            _location.value = GeoPoint(recent.latitude, recent.longitude)
+            onResult?.invoke(_location.value)
             return
         }
+
+        // Otherwise request a fresh fix and report it when it arrives.
+        pendingCallback = onResult
+        var requested = false
         for (provider in providers) {
             try {
                 lm.requestSingleUpdate(
@@ -41,6 +54,9 @@ object LocationController {
                     object : LocationListener {
                         override fun onLocationChanged(location: Location) {
                             _location.value = GeoPoint(location.latitude, location.longitude)
+                            val cb = pendingCallback
+                            pendingCallback = null
+                            cb?.invoke(_location.value)
                         }
 
                         @Deprecated("Deprecated in Java")
@@ -54,10 +70,15 @@ object LocationController {
                     },
                     Looper.getMainLooper()
                 )
+                requested = true
                 break
             } catch (_: SecurityException) {
             } catch (_: IllegalArgumentException) {
             }
+        }
+        if (!requested) {
+            pendingCallback = null
+            onResult?.invoke(_location.value)
         }
     }
 }
