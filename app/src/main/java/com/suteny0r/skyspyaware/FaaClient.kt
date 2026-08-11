@@ -78,14 +78,26 @@ object FaaClient {
                 "No FAA registration found"
             } else {
                 val first = items!!.getJSONObject(0)
-                val parts = mutableListOf("$n record(s) found")
-                listOf("manufacturer", "model", "commonName", "serialNumber")
-                    .forEach { key ->
-                        first.optString(key, "")
-                            .takeIf { it.isNotBlank() }
-                            ?.let { parts += "${key.replaceFirstChar { c -> c.uppercase() }}: $it" }
+                val sb = StringBuilder("$n record(s) found")
+                fun row(label: String, v: String) {
+                    if (v.isNotBlank()) sb.append('\n').append(label).append(": ").append(v)
+                }
+                row("Make", first.optString("makeName"))
+                row("Model", first.optString("modelName"))
+                row("Series", first.optString("series"))
+                row("Tracking #", first.optString("trackingNumber"))
+                row("Status", first.optString("status"))
+                row("Category", first.optString("categoryDeclarationFor"))
+                val compliance = first.optJSONArray("complianceCategories")
+                if (compliance != null && compliance.length() > 0) {
+                    val list = (0 until compliance.length()).joinToString(", ") {
+                        val el = compliance.get(it)
+                        if (el is String) el else el.toString()
                     }
-                parts.joinToString("\n")
+                    row("Compliance", list)
+                }
+                row("Updated", first.optString("updatedAt"))
+                sb.toString()
             }
         } catch (e: Exception) {
             "Registered (parse error)"
