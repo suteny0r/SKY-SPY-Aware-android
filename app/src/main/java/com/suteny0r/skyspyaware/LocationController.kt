@@ -25,6 +25,18 @@ object LocationController {
 
     private var pendingCallback: ((GeoPoint?) -> Unit)? = null
 
+    /** Any last known position from any provider, regardless of age, or null. */
+    fun lastKnown(context: Context): GeoPoint? {
+        val lm = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        return listOf(
+            LocationManager.GPS_PROVIDER,
+            LocationManager.NETWORK_PROVIDER
+        ).firstNotNullOfOrNull { provider ->
+            runCatching { lm.getLastKnownLocation(provider) }.getOrNull()
+                ?.let { GeoPoint(it.latitude, it.longitude) }
+        }
+    }
+
     @SuppressLint("MissingPermission")
     fun refresh(context: Context, onResult: ((GeoPoint?) -> Unit)? = null) {
         val lm = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager

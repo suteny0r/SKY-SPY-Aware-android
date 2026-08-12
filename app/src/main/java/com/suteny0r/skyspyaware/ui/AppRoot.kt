@@ -1,20 +1,25 @@
 package com.suteny0r.skyspyaware.ui
 
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -25,6 +30,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import com.suteny0r.skyspyaware.HISTORY_SCALE_ALL
 import com.suteny0r.skyspyaware.SkySpyViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -45,23 +51,31 @@ fun AppRoot(vm: SkySpyViewModel) {
     val selectedDrone = drones.firstOrNull { it.key == selectedKey }
 
     val historyMinutes by vm.historyMinutes.collectAsState()
+    val historyScale by vm.historyScale.collectAsState()
+    val historyMaxMinutes = vm.historyMaxMinutes()
     // Window filter: show only drones seen within the history window and clip
-    // their trails to that window. 0 = live only (~1 min).
-    val cutoffMs = if (historyMinutes <= 0) 60_000L else historyMinutes * 60_000L
+    // their trails to that window. 0 = live only (~1 min); "all" shows
+    // everything retained in memory.
+    val cutoffMs = when {
+        historyScale == HISTORY_SCALE_ALL -> 0L
+        historyMinutes <= 0 -> 60_000L
+        else -> historyMinutes * 60_000L
+    }
     val cutoff = System.currentTimeMillis() - cutoffMs
-    val visibleDrones = remember(drones, historyMinutes) {
+    val visibleDrones = remember(drones, historyMinutes, historyScale) {
         drones
             .filter { it.lastSeen >= cutoff }
             .map { it.copy(trail = it.trail.filter { p -> p.ts >= cutoff }) }
     }
 
-    fun select(key: String, jumpToMap: Boolean) {
+    // Selecting a drone (map marker / path tap, list tap, or notification)
+    // always shows its detail on the List tab. focusKey still centers the map
+    // on the drone whenever the Map tab is shown afterward.
+    fun select(key: String) {
         selectedKey = key
-        if (jumpToMap) {
-            focusKey = key
-            focusTick++
-            tab = 0
-        }
+        focusKey = key
+        focusTick++
+        tab = 1
     }
 
     // When a new-drone notification is tapped, jump to that drone even if it
@@ -69,7 +83,7 @@ fun AppRoot(vm: SkySpyViewModel) {
     val pendingSelection by vm.pendingSelection.collectAsState()
     LaunchedEffect(pendingSelection) {
         pendingSelection?.let { key ->
-            select(key, jumpToMap = true)
+            select(key)
             vm.consumePendingSelection()
         }
     }
@@ -127,23 +141,34 @@ fun AppRoot(vm: SkySpyViewModel) {
                         mapStyle = it
                         vm.setMapStyle(it)
                     },
-                    onDroneSelected = { key -> select(key, jumpToMap = false) },
+                    onDroneSelected = { key -> select(key) },
                     focusKey = focusKey,
                     focusTick = focusTick,
                     historyMinutes = historyMinutes,
                     onHistoryChange = { vm.setHistoryMinutes(it) },
+                    historyScale = historyScale,
+                    historyMaxMinutes = historyMaxMinutes,
                     modifier = Modifier.fillMaxSize()
                 )
-                1 -> ListScreen(visibleDrones, onSelect = { key -> select(key, jumpToMap = true) })
+                1 -> if (selectedDrone != null) {
+                    Column(Modifier.fillMaxSize()) {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp)) {
+                            TextButton(onClick = { selectedKey = null }) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.ArrowBack,
+                                    contentDescription = "Back to list"
+                                )
+                                Text("List", modifier = Modifier.padding(start = 4.dp))
+                            }
+                        }
+                        DroneDetail(selectedDrone, faa[selectedDrone.basicId])
+                    }
+                } else {
+                    ListScreen(visibleDrones, onSelect = { key -> select(key) })
+                }
                 2 -> ConsoleScreen(console)
                 3 -> SettingsScreen(vm)
             }
-        }
-    }
-
-    if (selectedDrone != null) {
-        ModalBottomSheet(onDismissRequest = { selectedKey = null }) {
-            DroneDetail(selectedDrone, faa[selectedDrone.basicId])
         }
     }
 }

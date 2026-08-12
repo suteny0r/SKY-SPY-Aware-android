@@ -22,7 +22,21 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-const val MAX_HISTORY_MINUTES = 1440
+const val HISTORY_SCALE_DAY = "day"
+const val HISTORY_SCALE_WEEK = "week"
+const val HISTORY_SCALE_MONTH = "month"
+const val HISTORY_SCALE_ALL = "all"
+
+/** History-window scales offered by the map slider dropdown. */
+val HISTORY_SCALES: List<Pair<String, String>> = listOf(
+    HISTORY_SCALE_DAY to "1 day",
+    HISTORY_SCALE_WEEK to "1 week",
+    HISTORY_SCALE_MONTH to "1 month",
+    HISTORY_SCALE_ALL to "All"
+)
+
+/** Size of the retained drone detection history. */
+data class HistoryStats(val count: Long, val drones: Long, val bytes: Long)
 
 /**
  * Singleton data layer shared by the UI (via [SkySpyViewModel]) and the
@@ -32,9 +46,9 @@ const val MAX_HISTORY_MINUTES = 1440
  */
 object DataRepo {
 
-    private const val DRONE_RETENTION_MS = DetectionCache.RETAIN_MS
     private const val CONSOLE_LIMIT = 500
     private const val TRAIL_MAX = 500
+    private const val PRUNE_INTERVAL_MS = 60L * 60 * 1000
     const val FOREGROUND_NOTIF_ID = 1
     const val CHANNEL_COLLECTING = "skyspy_collecting"
     const val CHANNEL_DETECTIONS = "skyspy_detections"
@@ -64,8 +78,17 @@ object DataRepo {
     private val _historyMinutes = MutableStateFlow(30)
     val historyMinutes: StateFlow<Int> = _historyMinutes.asStateFlow()
 
+    private val _historyScale = MutableStateFlow(HISTORY_SCALE_DAY)
+    val historyScale: StateFlow<String> = _historyScale.asStateFlow()
+
+    private val _autoPruneScale = MutableStateFlow(HISTORY_SCALE_ALL)
+    val autoPruneScale: StateFlow<String> = _autoPruneScale.asStateFlow()
+
     private val _pendingSelection = MutableStateFlow<String?>(null)
     val pendingSelection: StateFlow<String?> = _pendingSelection.asStateFlow()
+
+    private val _historyStats = MutableStateFlow(HistoryStats(0, 0, 0))
+    val historyStats: StateFlow<HistoryStats> = _historyStats.asStateFlow()
 
     private val droneMap = LinkedHashMap<String, Drone>()
     private val consoleBuffer = ArrayDeque<String>()
@@ -76,20 +99,26 @@ object DataRepo {
     private val faaScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val cacheScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    private var lastPruneMs = 0L
+
     @Synchronized
     fun init(context: Context) {
         if (::appContext.isInitialized) return
         appContext = context.applicationContext
         createChannels()
+        _historyScale.value = settingsRepo.getHistoryScale()
         _historyMinutes.value = settingsRepo.getHistoryMinutes()
+        _autoPruneScale.value = settingsRepo.getAutoPruneScale()
         mqtt.onLine = { line -> handleLine(line) }
         ageJob = scope.launch {
             while (isActive) {
-                delay(5000)
                 ageOut()
+                pruneExpired()
+                delay(5000)
             }
         }
         loadCachedHistory()
+        refreshHistoryStats()
     }
 
     // ----- lifecycle: collecting starts/stops -----
@@ -212,9 +241,12 @@ object DataRepo {
     private fun loadCachedHistory() {
         cacheScope.launch {
             val now = System.currentTimeMillis()
+            val retention = retentionMs()
+            val cutoff = if (retention == Long.MAX_VALUE) 0L else now - retention
             try {
-                cache.prune(now - DRONE_RETENTION_MS)
-                val rows = cache.loadSince(now - DRONE_RETENTION_MS)
+                // Rebuild live drone state for the selected window. Older
+                // detections stay in the DB for long-range analysis.
+                val rows = cache.loadSince(cutoff)
                 rows.forEach { updateDrone(it.toDetection(), it.ts, faa = true, notify = false) }
             } catch (_: Exception) {
             }
@@ -222,25 +254,42 @@ object DataRepo {
         }
     }
 
+    /** Rebuild live drone state from the DB for the currently selected window. */
+    private fun reloadHistory() {
+        cacheScope.launch {
+            val now = System.currentTimeMillis()
+            val retention = retentionMs()
+            val cutoff = if (retention == Long.MAX_VALUE) 0L else now - retention
+            val rows = try {
+                cache.loadSince(cutoff)
+            } catch (_: Exception) {
+                emptyList()
+            }
+            synchronized(droneMap) {
+                droneMap.clear()
+                rows.forEach { updateDrone(it.toDetection(), it.ts, faa = true, notify = false) }
+            }
+            _drones.value = droneMap.values.toList()
+        }
+    }
+
     private fun ageOut() {
+        val retention = retentionMs()
+        if (retention == Long.MAX_VALUE) return
         val now = System.currentTimeMillis()
         var changed = false
         synchronized(droneMap) {
             val it = droneMap.entries.iterator()
             while (it.hasNext()) {
-                if (now - it.next().value.lastSeen > DRONE_RETENTION_MS) {
+                if (now - it.next().value.lastSeen > retention) {
                     it.remove()
                     changed = true
                 }
             }
         }
         if (changed) {
-            try {
-                cache.prune(now - DRONE_RETENTION_MS)
-            } catch (_: Exception) {
-            }
+            _drones.value = droneMap.values.toList()
         }
-        _drones.value = droneMap.values.toList()
     }
 
     // ----- FAA -----
@@ -268,10 +317,78 @@ object DataRepo {
     fun getMapStyle(): Int = settingsRepo.getMapStyle()
     fun setMapStyle(index: Int) = settingsRepo.setMapStyle(index)
 
+    /** Max slider range (minutes) for the current history-window scale. */
+    fun historyMaxMinutes(): Int = when (_historyScale.value) {
+        HISTORY_SCALE_WEEK -> 7 * 24 * 60
+        HISTORY_SCALE_MONTH -> 30 * 24 * 60
+        HISTORY_SCALE_ALL -> Int.MAX_VALUE
+        else -> 24 * 60
+    }
+
+    /** In-memory drone-state retention for the current scale. */
+    private fun retentionMs(): Long = when (_historyScale.value) {
+        HISTORY_SCALE_WEEK -> 7L * 24 * 60 * 60 * 1000
+        HISTORY_SCALE_MONTH -> 30L * 24 * 60 * 60 * 1000
+        HISTORY_SCALE_ALL -> Long.MAX_VALUE
+        else -> 24L * 60 * 60 * 1000
+    }
+
+    fun setHistoryScale(scale: String) {
+        val v = if (HISTORY_SCALES.any { it.first == scale }) scale else HISTORY_SCALE_DAY
+        _historyScale.value = v
+        settingsRepo.setHistoryScale(v)
+        _historyMinutes.value = _historyMinutes.value.coerceAtMost(historyMaxMinutes())
+        reloadHistory()
+    }
+
     fun setHistoryMinutes(minutes: Int) {
-        val v = minutes.coerceIn(0, MAX_HISTORY_MINUTES)
+        val v = minutes.coerceIn(0, historyMaxMinutes())
         _historyMinutes.value = v
         settingsRepo.setHistoryMinutes(v)
+    }
+
+    /** How long the database retains detections before auto-prune. */
+    private fun pruneRetentionMs(): Long = when (_autoPruneScale.value) {
+        HISTORY_SCALE_WEEK -> 7L * 24 * 60 * 60 * 1000
+        HISTORY_SCALE_MONTH -> 30L * 24 * 60 * 60 * 1000
+        HISTORY_SCALE_ALL -> Long.MAX_VALUE
+        else -> 24L * 60 * 60 * 1000
+    }
+
+    /** Trim expired detections from the database on a schedule. */
+    private fun pruneExpired() {
+        val r = pruneRetentionMs()
+        if (r == Long.MAX_VALUE) return
+        val now = System.currentTimeMillis()
+        if (now - lastPruneMs < PRUNE_INTERVAL_MS) return
+        lastPruneMs = now
+        cacheScope.launch {
+            try {
+                cache.prune(now - r)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** Select the auto-prune length and immediately drop older history. */
+    fun setAutoPruneScale(scale: String) {
+        val v = if (HISTORY_SCALES.any { it.first == scale }) scale else HISTORY_SCALE_ALL
+        _autoPruneScale.value = v
+        settingsRepo.setAutoPruneScale(v)
+        pruneNow()
+        reloadHistory()
+        refreshHistoryStats()
+    }
+
+    private fun pruneNow() {
+        val r = pruneRetentionMs()
+        if (r == Long.MAX_VALUE) return
+        cacheScope.launch {
+            try {
+                cache.prune(System.currentTimeMillis() - r)
+            } catch (_: Exception) {
+            }
+        }
     }
 
     /** Called when a new-drone notification is tapped. */
@@ -281,6 +398,36 @@ object DataRepo {
 
     fun consumePendingSelection() {
         _pendingSelection.value = null
+    }
+
+    // ----- history retention -----
+
+    /** Recompute the size of the retained detection history. */
+    fun refreshHistoryStats() {
+        cacheScope.launch {
+            _historyStats.value = try {
+                HistoryStats(cache.count(), cache.uniqueDroneCount(), cache.dbSizeBytes())
+            } catch (_: Exception) {
+                HistoryStats(0, 0, 0)
+            }
+        }
+    }
+
+    /** Delete all retained detection history and clear live drone state. */
+    fun purgeHistory() {
+        cacheScope.launch {
+            try {
+                cache.purge()
+            } catch (_: Exception) {
+            }
+            synchronized(droneMap) { droneMap.clear() }
+            _drones.value = droneMap.values.toList()
+            _historyStats.value = try {
+                HistoryStats(cache.count(), cache.uniqueDroneCount(), cache.dbSizeBytes())
+            } catch (_: Exception) {
+                HistoryStats(0, 0, 0)
+            }
+        }
     }
 
     // ----- notifications -----

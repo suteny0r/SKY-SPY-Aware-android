@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import java.io.File
 
 /** A cached detection row with its arrival timestamp. */
 data class CachedDetection(
@@ -23,9 +24,9 @@ data class CachedDetection(
 }
 
 /**
- * Persistent ring buffer of incoming detections (SQLite). All data is kept
- * for [RETAIN_MS] so the app can rebuild drone state after a restart and show
- * history up to 24 hours old.
+ * Persistent store of incoming detections (SQLite). History is kept
+ * indefinitely so long-range analysis stays possible. After a restart the app
+ * rebuilds drone state for the recent history window from this store.
  */
 class DetectionCache(context: Context) {
 
@@ -83,9 +84,52 @@ class DetectionCache(context: Context) {
         return out
     }
 
+    /** Number of stored detections. */
+    fun count(): Long {
+        synchronized(lock) {
+            db.rawQuery("SELECT COUNT(*) FROM detections", null).use { c ->
+                return if (c.moveToFirst()) c.getLong(0) else 0L
+            }
+        }
+    }
+
+    /** Number of unique drones (distinct basic-id-or-mac keys) in history. */
+    fun uniqueDroneCount(): Long {
+        synchronized(lock) {
+            db.rawQuery(
+                "SELECT COUNT(*) FROM (" +
+                    "SELECT COALESCE(NULLIF(basic_id, ''), mac) AS k FROM detections GROUP BY k" +
+                    ")",
+                null
+            ).use { c ->
+                return if (c.moveToFirst()) c.getLong(0) else 0L
+            }
+        }
+    }
+
+    /** Approximate on-disk size of the history database, in bytes. */
+    fun dbSizeBytes(): Long = try {
+        File(db.path).length()
+    } catch (_: Exception) {
+        0L
+    }
+
+    /** Delete all stored detections older than [beforeMs]. */
     fun prune(beforeMs: Long) {
         synchronized(lock) {
             db.delete("detections", "ts < ?", arrayOf(beforeMs.toString()))
+        }
+    }
+
+    /** Delete every stored detection and reclaim the disk space. */
+    fun purge(): Long {
+        synchronized(lock) {
+            val removed = db.delete("detections", null, null).toLong()
+            try {
+                db.execSQL("VACUUM")
+            } catch (_: Exception) {
+            }
+            return removed
         }
     }
 
@@ -109,9 +153,5 @@ class DetectionCache(context: Context) {
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
-    }
-
-    companion object {
-        const val RETAIN_MS = 24L * 60 * 60 * 1000
     }
 }

@@ -55,6 +55,20 @@ class SettingsRepository(context: Context) {
         prefs.edit().putInt("historyMinutes", minutes).apply()
     }
 
+    /** History-window scale for the map slider (day/week/month/all). */
+    fun getHistoryScale(): String = prefs.getString("historyScale", DEFAULT_HISTORY_SCALE)!!
+
+    fun setHistoryScale(scale: String) {
+        prefs.edit().putString("historyScale", scale).apply()
+    }
+
+    /** How long history is kept before auto-prune (day/week/month/all). */
+    fun getAutoPruneScale(): String = prefs.getString("autoPruneScale", DEFAULT_AUTO_PRUNE_SCALE)!!
+
+    fun setAutoPruneScale(scale: String) {
+        prefs.edit().putString("autoPruneScale", scale).apply()
+    }
+
     /** Whether background MQTT collection is wanted (defaults to on). */
     fun getCollectingEnabled(): Boolean = prefs.getBoolean("collectingEnabled", true)
 
@@ -64,6 +78,8 @@ class SettingsRepository(context: Context) {
 
     companion object {
         const val DEFAULT_HISTORY_MINUTES = 30
+        const val DEFAULT_HISTORY_SCALE = "day"
+        const val DEFAULT_AUTO_PRUNE_SCALE = HISTORY_SCALE_ALL
         const val DEFAULT_BROKER = "65604cba457d4f8992aefe5820219ae4.s1.eu.hivemq.cloud"
         const val DEFAULT_PORT = 8883
         const val DEFAULT_TLS = true

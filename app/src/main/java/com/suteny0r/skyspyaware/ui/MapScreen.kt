@@ -44,8 +44,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.graphics.drawable.toDrawable
 import com.suteny0r.skyspyaware.Drone
+import com.suteny0r.skyspyaware.HISTORY_SCALE_ALL
 import com.suteny0r.skyspyaware.LocationController
-import com.suteny0r.skyspyaware.MAX_HISTORY_MINUTES
 import org.osmdroid.events.MapListener
 import org.osmdroid.events.ScrollEvent
 import org.osmdroid.events.ZoomEvent
@@ -218,6 +218,7 @@ private object IconCache {
 
 private fun historyLabel(mins: Int): String = when {
     mins <= 0 -> "live only"
+    mins % (24 * 60) == 0 -> "${mins / (24 * 60)}d"
     mins < 60 -> "${mins}m"
     mins % 60 == 0 -> "${mins / 60}h"
     else -> "${mins / 60}h ${mins % 60}m"
@@ -269,6 +270,8 @@ fun MapScreen(
     focusTick: Int,
     historyMinutes: Int,
     onHistoryChange: (Int) -> Unit,
+    historyScale: String,
+    historyMaxMinutes: Int,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -313,12 +316,32 @@ fun MapScreen(
         }
     }
 
-    // Center on the device location only if no saved camera and the user
-    // hasn't panned or requested a specific drone.
+    // Center on the device location when the map first shows, so a fresh
+    // install never sits on the default (0,0) ocean view. Without a saved
+    // camera or a requested drone: use any last-known position immediately,
+    // request a fresh fix, then center on the fix when it arrives. Centering
+    // happens once per map attach so later location updates never fight the
+    // user's view.
+    var centeredOnLocation by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        if (savedCamera == null && focusKey == null) {
+            LocationController.refresh(context)
+            LocationController.lastKnown(context)?.let { loc ->
+                if (!centeredOnLocation) {
+                    mapView.controller.setCenter(loc)
+                    mapView.controller.setZoom(INITIAL_ZOOM)
+                    centeredOnLocation = true
+                }
+            }
+        }
+    }
     LaunchedEffect(myLocation) {
-        if (savedCamera == null && focusKey == null && !userMoved && myLocation != null) {
+        if (!centeredOnLocation && myLocation != null &&
+            savedCamera == null && focusKey == null
+        ) {
             mapView.controller.setCenter(myLocation!!)
             mapView.controller.setZoom(INITIAL_ZOOM)
+            centeredOnLocation = true
         }
     }
 
@@ -381,6 +404,10 @@ fun MapScreen(
                         paint.color = 0xE6000000.toInt()
                         paint.strokeWidth = 5f * density
                         paint.strokeCap = Paint.Cap.ROUND
+                        setOnClickListener { _, _, _ ->
+                            onDroneSelected(d.key)
+                            true
+                        }
                         mapView.overlays.add(this)
                     }
                 }
@@ -389,6 +416,10 @@ fun MapScreen(
                         paint.color = 0xFFFFFFFF.toInt()
                         paint.strokeWidth = 3f * density
                         paint.strokeCap = Paint.Cap.ROUND
+                        setOnClickListener { _, _, _ ->
+                            onDroneSelected(d.key)
+                            true
+                        }
                         mapView.overlays.add(this)
                     }
                 }
@@ -399,6 +430,8 @@ fun MapScreen(
                 val dm = droneMarkers.getOrPut(d.key) {
                     Marker(mapView).apply {
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                        // Never show the default white info bubble on tap.
+                        setInfoWindow(null)
                         setOnMarkerClickListener { _, _ ->
                             onDroneSelected(d.key)
                             true
@@ -421,6 +454,8 @@ fun MapScreen(
                         Marker(mapView).apply {
                             setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                             title = "Pilot"
+                            // Never show the default white info bubble on tap.
+                            setInfoWindow(null)
                             setOnMarkerClickListener { _, _ ->
                                 onDroneSelected(d.key)
                                 true
@@ -438,6 +473,10 @@ fun MapScreen(
                         Polyline(mapView).apply {
                             paint.color = 0xCC00BCD4.toInt()
                             paint.strokeWidth = 4f
+                            setOnClickListener { _, _, _ ->
+                                onDroneSelected(d.key)
+                                true
+                            }
                             mapView.overlays.add(this)
                         }
                     }
@@ -520,18 +559,29 @@ fun MapScreen(
                         tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        "  History: ${historyLabel(historyMinutes)}",
+                        "  History: ${
+                            if (historyScale == HISTORY_SCALE_ALL) "all"
+                            else historyLabel(historyMinutes)
+                        }",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                Slider(
-                    value = historyMinutes.toFloat(),
-                    onValueChange = {
-                        onHistoryChange(it.toInt().coerceIn(0, MAX_HISTORY_MINUTES))
-                    },
-                    valueRange = 0f..MAX_HISTORY_MINUTES.toFloat()
-                )
+                if (historyScale != HISTORY_SCALE_ALL) {
+                    Slider(
+                        value = historyMinutes.toFloat(),
+                        onValueChange = {
+                            onHistoryChange(it.toInt().coerceIn(0, historyMaxMinutes))
+                        },
+                        valueRange = 0f..historyMaxMinutes.toFloat()
+                    )
+                } else {
+                    Text(
+                        "Showing all retained history",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
     }

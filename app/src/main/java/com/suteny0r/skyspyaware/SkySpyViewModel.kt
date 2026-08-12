@@ -23,7 +23,10 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
     val connected: StateFlow<Boolean> = DataRepo.connected
     val faa: StateFlow<Map<String, String>> = DataRepo.faa
     val historyMinutes: StateFlow<Int> = DataRepo.historyMinutes
+    val historyScale: StateFlow<String> = DataRepo.historyScale
+    val autoPruneScale: StateFlow<String> = DataRepo.autoPruneScale
     val pendingSelection: StateFlow<String?> = DataRepo.pendingSelection
+    val historyStats: StateFlow<HistoryStats> = DataRepo.historyStats
 
     fun connect() = DataRepo.startCollecting(getApplication())
     fun disconnect() = DataRepo.stopCollecting(getApplication())
@@ -33,5 +36,10 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
     fun getMapStyle(): Int = DataRepo.getMapStyle()
     fun setMapStyle(index: Int) = DataRepo.setMapStyle(index)
     fun setHistoryMinutes(minutes: Int) = DataRepo.setHistoryMinutes(minutes)
+    fun setHistoryScale(scale: String) = DataRepo.setHistoryScale(scale)
+    fun setAutoPruneScale(scale: String) = DataRepo.setAutoPruneScale(scale)
+    fun historyMaxMinutes(): Int = DataRepo.historyMaxMinutes()
     fun consumePendingSelection() = DataRepo.consumePendingSelection()
+    fun refreshHistoryStats() = DataRepo.refreshHistoryStats()
+    fun purgeHistory() = DataRepo.purgeHistory()
 }
