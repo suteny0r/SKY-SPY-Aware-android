@@ -347,15 +347,18 @@ fun MapScreen(
 
     // Center on a drone when the user requests it (list tap / marker tap /
     // notification tap). Uses the full retained set so it centers on the last
-    // known position even if the drone is outside the history window. Runs
-    // after the camera-restore and my-location effects so it wins, and marks
-    // the map as user-moved so the device location never fights it.
-    LaunchedEffect(focusTick) {
-        if (focusKey != null) {
-            allDrones.firstOrNull { it.key == focusKey }?.let {
-                mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
-                userMoved = true
-            }
+    // known position even if the drone is outside the history window. Re-runs
+    // when the retained set loads so a cold-start notification centers even if
+    // the drone hasn't been replayed from the DB yet, but only centers once
+    // per request so later updates never fight the user's view. Runs after the
+    // camera-restore and my-location effects so it wins.
+    var lastCenteredTick by remember { mutableStateOf(-1) }
+    LaunchedEffect(focusTick, allDrones) {
+        if (focusKey == null || lastCenteredTick == focusTick) return@LaunchedEffect
+        allDrones.firstOrNull { it.key == focusKey }?.let {
+            mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
+            userMoved = true
+            lastCenteredTick = focusTick
         }
     }
 

@@ -68,22 +68,22 @@ fun AppRoot(vm: SkySpyViewModel) {
             .map { it.copy(trail = it.trail.filter { p -> p.ts >= cutoff }) }
     }
 
-    // Selecting a drone (map marker / path tap, list tap, or notification)
-    // always shows its detail on the List tab. focusKey still centers the map
-    // on the drone whenever the Map tab is shown afterward.
-    fun select(key: String) {
+    // Selecting a drone (map marker / path tap, list tap, or notification).
+    // Map and list taps show the detail on the List tab; a notification tap
+    // opens the Map tab centered on the drone instead.
+    fun select(key: String, openMap: Boolean = false) {
         selectedKey = key
         focusKey = key
         focusTick++
-        tab = 1
+        tab = if (openMap) 0 else 1
     }
 
-    // When a new-drone notification is tapped, jump to that drone even if it
-    // is no longer actively broadcasting.
+    // When a new-drone notification is tapped, open the map centered on that
+    // drone even if it is no longer actively broadcasting.
     val pendingSelection by vm.pendingSelection.collectAsState()
     LaunchedEffect(pendingSelection) {
         pendingSelection?.let { key ->
-            select(key)
+            select(key, openMap = true)
             vm.consumePendingSelection()
         }
     }
