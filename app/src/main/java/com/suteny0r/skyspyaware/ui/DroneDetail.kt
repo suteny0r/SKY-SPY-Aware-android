@@ -31,13 +31,14 @@ fun DroneDetail(d: Drone, faa: String?) {
         Spacer(Modifier.height(12.dp))
 
         DetailRow("MAC", d.mac)
+        DetailRow("Last seen", formatTime(d.lastSeen))
         DetailRow("RSSI", "${d.rssi} dBm")
         DetailRow("Altitude", "${d.droneAltitude} m (${(d.droneAltitude * 3.28084).toInt()} ft)")
         DetailRow(
             "Drone",
             String.format(Locale.US, "%.6f, %.6f", d.droneLat, d.droneLon)
         )
-        if (d.pilotLat != 0.0 || d.pilotLon != 0.0) {
+        if (d.pilotLat != 0.0 && d.pilotLon != 0.0) {
             DetailRow(
                 "Pilot",
                 String.format(Locale.US, "%.6f, %.6f", d.pilotLat, d.pilotLon)
@@ -49,6 +50,8 @@ fun DroneDetail(d: Drone, faa: String?) {
                     haversine(d.droneLat, d.droneLon, d.pilotLat, d.pilotLon) / 1000.0
                 )
             )
+        } else {
+            DetailRow("Pilot", "unknown")
         }
         DetailRow("Detections", d.detections.toString())
 
@@ -83,8 +86,11 @@ private fun DetailRow(label: String, value: String) {
     }
 }
 
-fun haversine(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
-    val r = 6371000.0
+/** Phone-clock arrival time of the latest detection, as local time-of-day. */
+private fun formatTime(ts: Long): String =
+    java.text.SimpleDateFormat("MMM d, h:mm a", Locale.US).format(ts)
+
+fun haversine(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {    val r = 6371000.0
     val dLat = Math.toRadians(lat2 - lat1)
     val dLon = Math.toRadians(lon2 - lon1)
     val a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +

@@ -452,7 +452,7 @@ fun MapScreen(
                 dm.title = d.basicId.ifBlank { d.mac }
                 dm.snippet = "alt ${d.droneAltitude}m  RSSI ${d.rssi}  MAC ${d.mac}"
 
-                if (d.pilotLat != 0.0 || d.pilotLon != 0.0) {
+                if (d.pilotLat != 0.0 && d.pilotLon != 0.0) {
                     val pm = pilotMarkers.getOrPut(d.key) {
                         Marker(mapView).apply {
                             setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
