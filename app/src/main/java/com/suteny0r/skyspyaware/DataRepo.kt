@@ -21,14 +21,27 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.InputStream
+import java.io.OutputStream
 
 const val HISTORY_SCALE_DAY = "day"
 const val HISTORY_SCALE_WEEK = "week"
 const val HISTORY_SCALE_MONTH = "month"
+const val HISTORY_SCALE_YEAR = "year"
 const val HISTORY_SCALE_ALL = "all"
 
 /** History-window scales offered by the map slider dropdown. */
-val HISTORY_SCALES: List<Pair<String, String>> = listOf(
+val HISTORY_WINDOW_SCALES: List<Pair<String, String>> = listOf(
+    HISTORY_SCALE_DAY to "1 day",
+    HISTORY_SCALE_WEEK to "1 week",
+    HISTORY_SCALE_MONTH to "1 month",
+    HISTORY_SCALE_YEAR to "1 year"
+)
+
+/** Retention scales offered by the auto-prune dropdown. */
+val AUTO_PRUNE_SCALES: List<Pair<String, String>> = listOf(
     HISTORY_SCALE_DAY to "1 day",
     HISTORY_SCALE_WEEK to "1 week",
     HISTORY_SCALE_MONTH to "1 month",
@@ -47,8 +60,20 @@ data class HistoryStats(val count: Long, val drones: Long, val bytes: Long)
 object DataRepo {
 
     private const val CONSOLE_LIMIT = 500
-    private const val TRAIL_MAX = 500
+    private const val TRAIL_MAX = 20000
     private const val PRUNE_INTERVAL_MS = 60L * 60 * 1000
+    private const val FAA_RETRY_POLL_MS = 60_000L
+    private const val FAA_LOOKUP_INTERVAL_MS = 5_000L
+    private const val SATELLITE_TTL_MS = 24L * 60 * 60 * 1000
+    private const val FLIGHT_QUIET_MS = 150_000L   // 2.5 min without a fix = flight over
+    private const val FLIGHT_CLASSIFY_POLL_MS = 30_000L
+    private const val FLIGHT_CLASSIFY_COOLDOWN_MS = 30L * 60 * 1000
+    // Only drones seen within this window are candidates for an automatic
+    // satellite scan. After an import of months of history the retained set
+    // can be hundreds of drones; scanning all of them at once allocates a
+    // bitmap stack per drone and OOMs the process. Historical drones simply
+    // keep whatever cache they already have.
+    private const val SATELLITE_SCAN_WINDOW_MS = 24L * 60 * 60 * 1000
     const val FOREGROUND_NOTIF_ID = 1
     const val CHANNEL_COLLECTING = "skyspy_collecting"
     const val CHANNEL_DETECTIONS = "skyspy_detections"
@@ -90,14 +115,37 @@ object DataRepo {
     private val _historyStats = MutableStateFlow(HistoryStats(0, 0, 0))
     val historyStats: StateFlow<HistoryStats> = _historyStats.asStateFlow()
 
+    private val _stats = MutableStateFlow<Statistics?>(null)
+    val stats: StateFlow<Statistics?> = _stats.asStateFlow()
+
+    private val _faaPlatform = MutableStateFlow<Map<String, String>>(emptyMap())
+    val faaPlatform: StateFlow<Map<String, String>> = _faaPlatform.asStateFlow()
+
+    private val satelliteCounts = HashMap<String, Map<String, Int>>()
+    private val satelliteTs = HashMap<String, Long>()
+    private val _satellite = MutableStateFlow<Map<String, Map<String, Int>>>(emptyMap())
+    val satellite: StateFlow<Map<String, Map<String, Int>>> = _satellite.asStateFlow()
+
     private val droneMap = LinkedHashMap<String, Drone>()
     private val consoleBuffer = ArrayDeque<String>()
     private val faaCache = HashMap<String, String>()
+    private val faaRetryAt = HashMap<String, Long>()
+    private val faaAttempts = HashMap<String, Int>()
+    private val faaQueue = ArrayDeque<String>()
+    private val faaQueued = HashSet<String>()
+    private val faaPlatformLabels = HashMap<String, String>()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var ageJob: Job? = null
+    private var faaLookupJob: Job? = null
     private val faaScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val cacheScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Drone keys with an in-flight completion classify, to avoid overlap. */
+    private val flightClassifying = HashSet<String>()
+
+    /** Last wall-clock time a drone was auto-classified, to throttle rescans. */
+    private val flightClassifiedTs = HashMap<String, Long>()
 
     private var lastPruneMs = 0L
 
@@ -106,7 +154,10 @@ object DataRepo {
         if (::appContext.isInitialized) return
         appContext = context.applicationContext
         createChannels()
-        _historyScale.value = settingsRepo.getHistoryScale()
+        _historyScale.value = when (val s = settingsRepo.getHistoryScale()) {
+            HISTORY_SCALE_ALL -> HISTORY_SCALE_YEAR
+            else -> s
+        }
         _historyMinutes.value = settingsRepo.getHistoryMinutes()
         _autoPruneScale.value = settingsRepo.getAutoPruneScale()
         mqtt.onLine = { line -> handleLine(line) }
@@ -116,6 +167,47 @@ object DataRepo {
                 pruneExpired()
                 delay(5000)
             }
+        }
+        scope.launch {
+            while (isActive) {
+                try {
+                    classifyCompletedFlights()
+                } catch (_: Exception) {
+                }
+                delay(FLIGHT_CLASSIFY_POLL_MS)
+            }
+        }
+        faaLookupJob = startFaaWorker()
+        cacheScope.launch {
+            // One-time purge of satellite counts written by the broken YOLO
+            // decode (phantom swimming pools in the thousands).
+            if (!settingsRepo.isSatelliteCachePurged()) {
+                try {
+                    cache.clearSatelliteCache()
+                } catch (_: Exception) {
+                }
+                settingsRepo.markSatelliteCachePurged()
+            }
+            // Seed the in-memory cache with persisted lookups so restarts
+            // don't re-hit the API for records we already resolved.
+            try {
+                cache.loadFaaCache().forEach { (id, text) ->
+                    synchronized(faaCache) { if (!faaCache.containsKey(id)) faaCache[id] = text }
+                }
+                cache.loadFaaPlatforms().forEach { (id, label) ->
+                    synchronized(faaPlatformLabels) { if (!faaPlatformLabels.containsKey(id)) faaPlatformLabels[id] = label }
+                }
+                cache.loadSatelliteCache().forEach { (key, pair) ->
+                    synchronized(satelliteCounts) {
+                        satelliteCounts[key] = decodeCounts(pair.first)
+                        satelliteTs[key] = pair.second
+                    }
+                }
+            } catch (_: Exception) {
+            }
+            _faa.value = HashMap(faaCache)
+            _faaPlatform.value = HashMap(faaPlatformLabels)
+            _satellite.value = HashMap(satelliteCounts)
         }
         loadCachedHistory()
         refreshHistoryStats()
@@ -202,20 +294,32 @@ object DataRepo {
             val isNew = prev == null
             val macPositions = (prev?.macPositions ?: emptyMap()).toMutableMap()
             val lastForMac = macPositions[d.mac]
-            // A drone can broadcast on multiple MACs (AP beacon vs NAN) with
-            // different positions. Only advance when THIS MAC reports a
-            // changed position, or the drone position flip-flops every frame.
-            val macChanged = lastForMac == null ||
-                lastForMac.first != d.droneLat || lastForMac.second != d.droneLon
-            if (macChanged) macPositions[d.mac] = d.droneLat to d.droneLon
-
-            val effectiveLat = if (macChanged) d.droneLat else (prev?.droneLat ?: d.droneLat)
-            val effectiveLon = if (macChanged) d.droneLon else (prev?.droneLon ?: d.droneLon)
-            val trail = if (macChanged) {
-                ((prev?.trail ?: emptyList()) + TrailPoint(ts, effectiveLat, effectiveLon))
-                    .takeLast(TRAIL_MAX)
+            // Null-island coordinates (exact (0,0) or the small box around it)
+            // are the beacon's "no position known" sentinel. Keep the last
+            // known position and never grow the trail from the ocean point.
+            val hasPos = isValidPosition(d.droneLat, d.droneLon)
+            val effectiveLat: Double
+            val effectiveLon: Double
+            val trail: List<TrailPoint>
+            if (hasPos) {
+                // A drone can broadcast on multiple MACs (AP beacon vs NAN) with
+                // different positions. Only advance when THIS MAC reports a
+                // changed position, or the drone position flip-flops every frame.
+                val macChanged = lastForMac == null ||
+                    lastForMac.first != d.droneLat || lastForMac.second != d.droneLon
+                if (macChanged) macPositions[d.mac] = d.droneLat to d.droneLon
+                effectiveLat = if (macChanged) d.droneLat else (prev?.droneLat ?: d.droneLat)
+                effectiveLon = if (macChanged) d.droneLon else (prev?.droneLon ?: d.droneLon)
+                trail = if (macChanged) {
+                    ((prev?.trail ?: emptyList()) + TrailPoint(ts, effectiveLat, effectiveLon))
+                        .takeLast(TRAIL_MAX)
+                } else {
+                    prev?.trail ?: listOf(TrailPoint(ts, effectiveLat, effectiveLon))
+                }
             } else {
-                prev?.trail ?: listOf(TrailPoint(ts, effectiveLat, effectiveLon))
+                effectiveLat = prev?.droneLat ?: 0.0
+                effectiveLon = prev?.droneLon ?: 0.0
+                trail = prev?.trail ?: emptyList()
             }
 
             droneMap[key] = Drone(
@@ -235,7 +339,7 @@ object DataRepo {
             )
             if (notify && isNew) notifyNewDrone(key, d.mac, d.basicId)
         }
-        if (faa && d.basicId.isNotBlank()) faaLookup(d.basicId)
+        if (faa && d.basicId.isNotBlank()) enqueueFaaLookup(d.basicId)
     }
 
     private fun loadCachedHistory() {
@@ -251,6 +355,7 @@ object DataRepo {
             } catch (_: Exception) {
             }
             _drones.value = droneMap.values.toList()
+            enqueueAllFaa()
         }
     }
 
@@ -270,6 +375,7 @@ object DataRepo {
                 rows.forEach { updateDrone(it.toDetection(), it.ts, faa = true, notify = false) }
             }
             _drones.value = droneMap.values.toList()
+            enqueueAllFaa()
         }
     }
 
@@ -294,20 +400,85 @@ object DataRepo {
 
     // ----- FAA -----
 
-    private fun faaLookup(basicId: String) {
+    private fun enqueueFaaLookup(basicId: String) {
         synchronized(faaCache) {
-            if (faaCache.containsKey(basicId)) return
-            faaCache[basicId] = "" // mark in-flight
+            // Already resolved, in-flight, or waiting in the queue: skip.
+            if (faaCache.containsKey(basicId) || basicId in faaQueued) return
+            faaQueued.add(basicId)
+            faaQueue.addLast(basicId)
         }
-        faaScope.launch {
-            val result = try {
-                FaaClient.lookup(basicId)
-            } catch (e: Exception) {
-                "Lookup failed: ${e.message}"
+    }
+
+    /** Enqueue lookups for every known drone so the whole list resolves in the background. */
+    private fun enqueueAllFaa() {
+        val ids = synchronized(droneMap) {
+            droneMap.values.map { it.basicId }.filter { it.isNotBlank() }.toSet()
+        }
+        ids.forEach { enqueueFaaLookup(it) }
+    }
+
+    /**
+     * Single background worker resolving lookups one at a time with a minimum
+     * interval between requests, so we never burst the FAA endpoint. Fresh
+     * queue entries take priority; failed lookups are retried later with
+     * backoff when the queue is idle.
+     */
+    private fun startFaaWorker(): Job? {
+        if (faaLookupJob?.isActive == true) return faaLookupJob
+        return faaScope.launch {
+            while (isActive) {
+                val id = nextFaaJob()
+                if (id == null) {
+                    delay(FAA_RETRY_POLL_MS)
+                    continue
+                }
+                synchronized(faaCache) { faaCache[id] = "" } // mark in-flight
+                val result = try {
+                    FaaClient.lookup(id)
+                } catch (e: Exception) {
+                    FaaLookup("Lookup failed: ${e.message}", true)
+                }
+                synchronized(faaCache) {
+                    if (result.retriable) {
+                        val attempt = (faaAttempts[id] ?: 0) + 1
+                        faaAttempts[id] = attempt
+                        faaRetryAt[id] = System.currentTimeMillis() + faaBackoffMs(attempt)
+                        faaCache[id] = "${result.text} (retrying)"
+                    } else {
+                        faaCache[id] = result.text
+                        faaRetryAt.remove(id)
+                        faaAttempts.remove(id)
+                        val platform = PublicSafetyPlatform.label(result.make, result.model)
+                        faaPlatformLabels[id] = platform ?: ""
+                        try {
+                            cache.saveFaaCache(id, result.text, platform)
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                _faa.value = HashMap(faaCache)
+                _faaPlatform.value = HashMap(faaPlatformLabels)
+                delay(FAA_LOOKUP_INTERVAL_MS)
             }
-            synchronized(faaCache) { faaCache[basicId] = result }
-            _faa.value = HashMap(faaCache)
         }
+    }
+
+    private fun nextFaaJob(): String? = synchronized(faaCache) {
+        if (faaQueue.isNotEmpty()) {
+            faaQueue.removeFirst().also { faaQueued.remove(it) }
+        } else {
+            val now = System.currentTimeMillis()
+            faaRetryAt.entries
+                .firstOrNull { it.value <= now && faaCache[it.key] != "" }
+                ?.key
+        }
+    }
+
+    private fun faaBackoffMs(attempt: Int): Long = when {
+        attempt <= 1 -> 5 * 60_000L
+        attempt == 2 -> 15 * 60_000L
+        attempt == 3 -> 60 * 60_000L
+        else -> 4 * 60 * 60_000L
     }
 
     // ----- settings -----
@@ -321,7 +492,7 @@ object DataRepo {
     fun historyMaxMinutes(): Int = when (_historyScale.value) {
         HISTORY_SCALE_WEEK -> 7 * 24 * 60
         HISTORY_SCALE_MONTH -> 30 * 24 * 60
-        HISTORY_SCALE_ALL -> Int.MAX_VALUE
+        HISTORY_SCALE_YEAR -> 365 * 24 * 60
         else -> 24 * 60
     }
 
@@ -329,12 +500,12 @@ object DataRepo {
     private fun retentionMs(): Long = when (_historyScale.value) {
         HISTORY_SCALE_WEEK -> 7L * 24 * 60 * 60 * 1000
         HISTORY_SCALE_MONTH -> 30L * 24 * 60 * 60 * 1000
-        HISTORY_SCALE_ALL -> Long.MAX_VALUE
+        HISTORY_SCALE_YEAR -> 365L * 24 * 60 * 60 * 1000
         else -> 24L * 60 * 60 * 1000
     }
 
     fun setHistoryScale(scale: String) {
-        val v = if (HISTORY_SCALES.any { it.first == scale }) scale else HISTORY_SCALE_DAY
+        val v = if (HISTORY_WINDOW_SCALES.any { it.first == scale }) scale else HISTORY_SCALE_DAY
         _historyScale.value = v
         settingsRepo.setHistoryScale(v)
         _historyMinutes.value = _historyMinutes.value.coerceAtMost(historyMaxMinutes())
@@ -372,7 +543,7 @@ object DataRepo {
 
     /** Select the auto-prune length and immediately drop older history. */
     fun setAutoPruneScale(scale: String) {
-        val v = if (HISTORY_SCALES.any { it.first == scale }) scale else HISTORY_SCALE_ALL
+        val v = if (AUTO_PRUNE_SCALES.any { it.first == scale }) scale else HISTORY_SCALE_ALL
         _autoPruneScale.value = v
         settingsRepo.setAutoPruneScale(v)
         pruneNow()
@@ -402,6 +573,60 @@ object DataRepo {
 
     // ----- history retention -----
 
+    /**
+     * Auto-classify drones whose flight has just ended: a drone that has had no
+     * new fix for [FLIGHT_QUIET_MS] and has a real trail gets a combined
+     * wide+tight satellite scan once, so the role assessment reflects the full
+     * flight footprint rather than the very short early path. Runs on a poll
+     * every [FLIGHT_CLASSIFY_POLL_MS]. A drone is only re-scanned after a new
+     * flight (a newer lastSeen) goes quiet again.
+     */
+    private suspend fun classifyCompletedFlights() {
+        val now = System.currentTimeMillis()
+        val candidates = synchronized(droneMap) { droneMap.values.toList() }
+        for (d in candidates) {
+            val key = d.key
+            // Skip drones mid-classify or that are still reporting fixes.
+            var busy = false
+            synchronized(flightClassifying) {
+                if (key in flightClassifying) busy = true else flightClassifying.add(key)
+            }
+            if (busy) continue
+            try {
+                if (now - d.lastSeen < FLIGHT_QUIET_MS) continue
+                // Historical drones (from imports / long retention) would all
+                // look "flight complete"; only auto-classify recent activity.
+                if (now - d.lastSeen > SATELLITE_SCAN_WINDOW_MS) continue
+                // Skip if this flight was already classified recently.
+                val lastClassified = synchronized(flightClassifiedTs) {
+                    flightClassifiedTs[key] ?: 0L
+                }
+                if (now - lastClassified < FLIGHT_CLASSIFY_COOLDOWN_MS) continue
+                val pts = d.trail.filter { isValidPosition(it.lat, it.lon) }
+                if (pts.size < 2) continue
+                val tight = SatelliteAnalyzer.boundsOfPoints(
+                    pts.map { it.lat to it.lon }, 150.0
+                ) ?: continue
+                val wide = SatelliteAnalyzer.boundsOfPoints(
+                    pts.map { it.lat to it.lon }, 700.0
+                ) ?: continue
+                val scan = try {
+                    SatelliteAnalyzer.scanCombined(appContext, wide, tight)
+                } catch (_: Exception) {
+                    SatelliteAnalyzer.AreaScan(emptyMap())
+                }
+                applySatelliteScan(key, scan.counts)
+                synchronized(flightClassifiedTs) {
+                    flightClassifiedTs[key] = now
+                }
+            } finally {
+                synchronized(flightClassifying) {
+                    flightClassifying.remove(key)
+                }
+            }
+        }
+    }
+
     /** Recompute the size of the retained detection history. */
     fun refreshHistoryStats() {
         cacheScope.launch {
@@ -413,6 +638,216 @@ object DataRepo {
         }
     }
 
+    /** Recompute statistics from the full retained history (background). */
+    fun refreshStats() {
+        cacheScope.launch {
+            computeStats()
+            satellitePass()
+            computeStats()
+        }
+    }
+
+    /** Guards against overlapping [satellitePass] runs (refreshStats can be
+     *  triggered repeatedly by applySatelliteScan / classifyCompletedFlights). */
+    private val satellitePassBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private suspend fun computeStats() {
+        val rows = try {
+            cache.loadSince(0L)
+        } catch (_: Exception) {
+            emptyList()
+        }
+        // Simulator drones are identified by basicIds that fail the FAA
+        // registration lookup.
+        val simulatorKeys = synchronized(faaCache) {
+            faaCache.filterValues { it == FAA_NOT_FOUND }.keys.toSet()
+        }
+        val sat = synchronized(satelliteCounts) { HashMap(satelliteCounts) }
+        _stats.value = try {
+            StatisticsCalculator.compute(rows, simulatorKeys, sat)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Refresh satellite object scans for drones whose cached scan is stale.
+     * Runs one scan at a time with a delay so we never burst the tile server.
+     */
+    private suspend fun satellitePass() {
+        if (!satellitePassBusy.compareAndSet(false, true)) return
+        try {
+            val ttl = System.currentTimeMillis() - SATELLITE_TTL_MS
+            val cutoff = System.currentTimeMillis() - SATELLITE_SCAN_WINDOW_MS
+            val keys = synchronized(droneMap) { droneMap.keys.toList() }
+            for (key in keys) {
+                val ts = synchronized(satelliteCounts) { satelliteTs[key] ?: 0L }
+                if (ts > ttl) continue
+                val d = synchronized(droneMap) { droneMap[key] } ?: continue
+                if (!isValidPosition(d.droneLat, d.droneLon)) continue
+                // Skip historical drones: only refresh live/very-recent activity.
+                if (d.lastSeen < cutoff) continue
+                val scan = try {
+                    SatelliteAnalyzer.scan(appContext, d.droneLat, d.droneLon)
+                } catch (_: Exception) {
+                    SatelliteAnalyzer.AreaScan(emptyMap())
+                }
+                val now = System.currentTimeMillis()
+                synchronized(satelliteCounts) {
+                    satelliteCounts[key] = scan.counts
+                    satelliteTs[key] = now
+                }
+                try {
+                    cache.saveSatelliteCache(key, encodeCounts(scan.counts), now)
+                } catch (_: Exception) {
+                }
+                delay(1000L)
+            }
+            _satellite.value = synchronized(satelliteCounts) { HashMap(satelliteCounts) }
+        } finally {
+            satellitePassBusy.set(false)
+        }
+    }
+
+    private fun encodeCounts(counts: Map<String, Int>): String = JSONObject(counts).toString()
+
+    private fun decodeCounts(json: String): Map<String, Int> {
+        if (json.isBlank()) return emptyMap()
+        return try {
+            val o = JSONObject(json)
+            val out = HashMap<String, Int>()
+            val it = o.keys()
+            while (it.hasNext()) {
+                val k = it.next()
+                out[k] = o.optInt(k, 0)
+            }
+            out
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    /** Write the full history database to [out]. */
+    suspend fun exportHistory(out: OutputStream): Boolean = withContext(Dispatchers.IO) {
+        try {
+            cache.exportTo(out)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /** Replace the history database with the contents of [input] and rebuild state. */
+    suspend fun importHistory(input: InputStream): Boolean = withContext(Dispatchers.IO) {
+        val ok = try {
+            cache.importFrom(input)
+        } catch (_: Exception) {
+            false
+        }
+        if (ok) rebuildAll()
+        ok
+    }
+
+    /** Full ordered flight trail for one drone from the entire database. */
+    suspend fun loadDroneFlights(key: String): List<TrailPoint> = withContext(Dispatchers.IO) {
+        try {
+            cache.loadDroneTrail(key)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Store an explicit satellite scan (e.g. from the flights screen) for one
+     * drone and immediately recompute statistics so role assessments reflect
+     * the fresh object counts instead of stale cached ones.
+     */
+    fun applySatelliteScan(key: String, counts: Map<String, Int>) {
+        val now = System.currentTimeMillis()
+        synchronized(satelliteCounts) {
+            satelliteCounts[key] = counts
+            satelliteTs[key] = now
+        }
+        try {
+            cache.saveSatelliteCache(key, encodeCounts(counts), now)
+        } catch (_: Exception) {
+        }
+        _satellite.value = synchronized(satelliteCounts) { HashMap(satelliteCounts) }
+        refreshStats()
+    }
+
+    /**
+     * Force a fresh satellite object scan around a drone's trail and apply it,
+     * so the role assessment is recalculated from live imagery. No-op if the
+     * drone has no known position.
+     */
+    suspend fun reclassify(context: Context, key: String): Map<String, Int>? {
+        val d = _drones.value.firstOrNull { it.key == key } ?: return null
+        if (!isValidPosition(d.droneLat, d.droneLon)) return null
+        val trail = d.trail
+            .filter { isValidPosition(it.lat, it.lon) }
+            .map { it.lat to it.lon }
+        val scan = if (trail.size >= 2) {
+            val tight = SatelliteAnalyzer.boundsOfPoints(trail, 150.0) ?: return null
+            val wide = SatelliteAnalyzer.boundsOfPoints(trail, 700.0) ?: return null
+            SatelliteAnalyzer.scanCombined(context, wide, tight)
+        } else {
+            val tight = SatelliteAnalyzer.boundsOfPoint(d.droneLat, d.droneLon, 150.0)
+            val wide = SatelliteAnalyzer.boundsOfPoint(d.droneLat, d.droneLon, 700.0)
+            SatelliteAnalyzer.scanCombined(context, wide, tight)
+        }
+        applySatelliteScan(key, scan.counts)
+        return scan.counts
+    }
+
+    /** Reset in-memory state and rebuild it from the current database. */
+    private suspend fun rebuildAll() {
+        synchronized(faaCache) {
+            faaCache.clear()
+            faaRetryAt.clear()
+            faaAttempts.clear()
+            faaQueue.clear()
+            faaQueued.clear()
+            faaPlatformLabels.clear()
+            try {
+                cache.loadFaaCache().forEach { (id, text) -> faaCache[id] = text }
+                cache.loadFaaPlatforms().forEach { (id, label) -> faaPlatformLabels[id] = label }
+            } catch (_: Exception) {
+            }
+        }
+        _faa.value = HashMap(faaCache)
+        _faaPlatform.value = HashMap(faaPlatformLabels)
+
+        synchronized(satelliteCounts) {
+            satelliteCounts.clear()
+            satelliteTs.clear()
+            try {
+                cache.loadSatelliteCache().forEach { (key, pair) ->
+                    satelliteCounts[key] = decodeCounts(pair.first)
+                    satelliteTs[key] = pair.second
+                }
+            } catch (_: Exception) {
+            }
+        }
+        _satellite.value = HashMap(satelliteCounts)
+
+        val now = System.currentTimeMillis()
+        val retention = retentionMs()
+        val cutoff = if (retention == Long.MAX_VALUE) 0L else now - retention
+        val rows = try {
+            cache.loadSince(cutoff)
+        } catch (_: Exception) {
+            emptyList()
+        }
+        synchronized(droneMap) {
+            droneMap.clear()
+            rows.forEach { updateDrone(it.toDetection(), it.ts, faa = true, notify = false) }
+        }
+        _drones.value = droneMap.values.toList()
+        enqueueAllFaa()
+        refreshHistoryStats()
+        refreshStats()
+    }
+
     /** Delete all retained detection history and clear live drone state. */
     fun purgeHistory() {
         cacheScope.launch {
@@ -420,6 +855,27 @@ object DataRepo {
                 cache.purge()
             } catch (_: Exception) {
             }
+            try {
+                cache.clearFaaCache()
+            } catch (_: Exception) {
+            }
+            try {
+                cache.clearSatelliteCache()
+            } catch (_: Exception) {
+            }
+            synchronized(faaCache) {
+                faaCache.clear()
+                faaRetryAt.clear()
+                faaAttempts.clear()
+                faaPlatformLabels.clear()
+            }
+            _faa.value = HashMap(faaCache)
+            _faaPlatform.value = HashMap(faaPlatformLabels)
+            synchronized(satelliteCounts) {
+                satelliteCounts.clear()
+                satelliteTs.clear()
+            }
+            _satellite.value = HashMap(satelliteCounts)
             synchronized(droneMap) { droneMap.clear() }
             _drones.value = droneMap.values.toList()
             _historyStats.value = try {

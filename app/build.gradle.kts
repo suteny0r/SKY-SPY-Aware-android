@@ -59,6 +59,9 @@ dependencies {
     // Map
     implementation("org.osmdroid:osmdroid-android:6.1.18")
 
+    // On-device satellite object detection
+    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 }

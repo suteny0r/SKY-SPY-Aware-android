@@ -1,5 +1,7 @@
 package com.suteny0r.skyspyaware.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,14 +33,18 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.suteny0r.skyspyaware.HISTORY_SCALE_ALL
-import com.suteny0r.skyspyaware.HISTORY_SCALES
+import com.suteny0r.skyspyaware.HISTORY_WINDOW_SCALES
+import com.suteny0r.skyspyaware.AUTO_PRUNE_SCALES
 import com.suteny0r.skyspyaware.MqttSettings
 import com.suteny0r.skyspyaware.SkySpyViewModel
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 @Composable
@@ -49,6 +55,34 @@ fun SettingsScreen(vm: SkySpyViewModel) {
     val historyStats by vm.historyStats.collectAsState()
     val autoPruneScale by vm.autoPruneScale.collectAsState()
     val historyScale by vm.historyScale.collectAsState()
+
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var dbMsg by remember { mutableStateOf<String?>(null) }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        uri ?: return@rememberLauncherForActivityResult
+        scope.launch {
+            val ok = context.contentResolver.openOutputStream(uri)?.use { stream ->
+                vm.exportHistory(stream)
+            } ?: false
+            dbMsg = if (ok) "History exported" else "Export failed"
+        }
+    }
+
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri ?: return@rememberLauncherForActivityResult
+        scope.launch {
+            val ok = context.contentResolver.openInputStream(uri)?.use { stream ->
+                vm.importHistory(stream)
+            } ?: false
+            dbMsg = if (ok) "History imported" else "Import failed"
+        }
+    }
 
     LaunchedEffect(Unit) {
         vm.refreshHistoryStats()
@@ -165,7 +199,7 @@ fun SettingsScreen(vm: SkySpyViewModel) {
             Box {
                 OutlinedButton(onClick = { windowMenu = true }) {
                     Text(
-                        HISTORY_SCALES.firstOrNull { it.first == historyScale }?.second
+                        HISTORY_WINDOW_SCALES.firstOrNull { it.first == historyScale }?.second
                             ?: historyScale,
                         style = MaterialTheme.typography.labelMedium
                     )
@@ -179,7 +213,7 @@ fun SettingsScreen(vm: SkySpyViewModel) {
                     expanded = windowMenu,
                     onDismissRequest = { windowMenu = false }
                 ) {
-                    HISTORY_SCALES.forEach { (value, label) ->
+                    HISTORY_WINDOW_SCALES.forEach { (value, label) ->
                         DropdownMenuItem(
                             text = { Text(label) },
                             onClick = {
@@ -232,6 +266,27 @@ fun SettingsScreen(vm: SkySpyViewModel) {
             }
         }
         Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { exportLauncher.launch("skyspy-detections.db") },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Export DB")
+            }
+            OutlinedButton(
+                onClick = { importLauncher.launch(arrayOf("*/*")) },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Import DB")
+            }
+        }
+        dbMsg?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.secondary
+            )
+        }
         Button(
             onClick = { vm.purgeHistory() },
             colors = ButtonDefaults.buttonColors(
@@ -243,15 +298,16 @@ fun SettingsScreen(vm: SkySpyViewModel) {
             Text("Purge history")
         }
         Text(
-            text = "History is auto-pruned after the selected period. Purging " +
-                    "permanently deletes all stored history.",
+            text = "History is auto-pruned after the selected period. Export " +
+                    "backs up the full history database; importing replaces it. " +
+                    "Purging permanently deletes all stored history.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
         )
     }
 }
 
-private val AUTO_PRUNE_OPTIONS: List<Pair<String, String>> = HISTORY_SCALES.map { (value, label) ->
+private val AUTO_PRUNE_OPTIONS: List<Pair<String, String>> = AUTO_PRUNE_SCALES.map { (value, label) ->
     value to if (value == HISTORY_SCALE_ALL) "Infinite" else label
 }
 

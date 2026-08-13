@@ -76,6 +76,18 @@ class SettingsRepository(context: Context) {
         prefs.edit().putBoolean("collectingEnabled", enabled).apply()
     }
 
+    /**
+     * The satellite object-count cache was written by a broken YOLO decode
+     * (thousands of phantom swimming pools per drone). It is purged exactly
+     * once after the fix so old corrupt counts never resurface.
+     */
+    fun isSatelliteCachePurged(): Boolean =
+        prefs.getBoolean("satelliteCachePurgedV2", false)
+
+    fun markSatelliteCachePurged() {
+        prefs.edit().putBoolean("satelliteCachePurgedV2", true).apply()
+    }
+
     companion object {
         const val DEFAULT_HISTORY_MINUTES = 30
         const val DEFAULT_HISTORY_SCALE = "day"

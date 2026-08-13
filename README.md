@@ -34,6 +34,25 @@ Handles the Sky Spy JSON lines published on `<topic>/raw`:
 
 Drones age out after 60 seconds without new data.
 
+## Satellite object classification
+
+The map and per-drone flight views can scan the surrounding area (a ~2.2 km block centered on the view) using the bundled on-device YOLOv8-OBB model (DOTAv1 pretrained, `satellite_yolo.tflite`). Detections are shown as colored boxes with a class + confidence label, and the class counts feed the drone role heuristic.
+
+Supported classes (15):
+
+| # | Class | # | Class |
+|---|---|---|---|
+| 1 | plane | 9 | bridge |
+| 2 | ship | 10 | large vehicle |
+| 3 | storage tank | 11 | small vehicle |
+| 4 | baseball diamond | 12 | helicopter |
+| 5 | tennis court | 13 | roundabout |
+| 6 | basketball court | 14 | soccer ball field |
+| 7 | ground track field | 15 | swimming pool |
+| 8 | harbor | | |
+
+Which classes appear depends on the terrain being scanned: open water reports mostly ship/harbor/bridge, while residential areas add swimming pools and land/industrial areas add vehicles, tanks, and courts.
+
 ## Building
 
 - Android Studio (Ladybug+) or command line with JDK 17+

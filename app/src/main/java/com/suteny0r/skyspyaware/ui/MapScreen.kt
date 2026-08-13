@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.MyLocation
@@ -32,26 +33,46 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Color as ComposeColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.graphics.drawable.toDrawable
 import com.suteny0r.skyspyaware.Drone
-import com.suteny0r.skyspyaware.HISTORY_SCALE_ALL
 import com.suteny0r.skyspyaware.LocationController
+import com.suteny0r.skyspyaware.YoloDetector
+import com.suteny0r.skyspyaware.isValidPosition
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.osmdroid.events.MapListener
 import org.osmdroid.events.ScrollEvent
 import org.osmdroid.events.ZoomEvent
 import org.osmdroid.tileprovider.tilesource.ITileSource
 import org.osmdroid.tileprovider.tilesource.OnlineTileSourceBase
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
 import org.osmdroid.util.MapTileIndex
 import org.osmdroid.views.CustomZoomButtonsController
@@ -224,6 +245,14 @@ private fun historyLabel(mins: Int): String = when {
     else -> "${mins / 60}h ${mins % 60}m"
 }
 
+/** Map slider label: a window spanning <= 1 week shows its length; past 1 week
+ *  the slider positions a fixed 1-week window, so show where it is in time. */
+private fun historyWindowLabel(mins: Int, startMs: Long, endMs: Long): String {
+    if (mins <= 7 * 24 * 60) return historyLabel(mins)
+    val fmt = SimpleDateFormat("MMM d HH:mm", Locale.US)
+    return "1w ${fmt.format(Date(startMs))} - ${fmt.format(Date(endMs))}"
+}
+
 /** Quadcopter glyph for the "center on activity" button. */
 @Composable
 private fun DroneGlyph(modifier: Modifier) {
@@ -270,8 +299,9 @@ fun MapScreen(
     focusTick: Int,
     historyMinutes: Int,
     onHistoryChange: (Int) -> Unit,
-    historyScale: String,
     historyMaxMinutes: Int,
+    windowStartMs: Long,
+    windowEndMs: Long,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -302,9 +332,67 @@ fun MapScreen(
     val pilotIconKeys = remember { HashMap<String, Boolean>() }
     val myLocation by LocationController.location.collectAsState()
     var userMoved by remember { mutableStateOf(false) }
+    var zoomLevel by remember { mutableStateOf(mapView.zoomLevelDouble) }
+
+    // On-demand classification of the current map viewport via on-device
+    // YOLO. When enabled we snapshot the rendered map, run detection off the
+    // main thread, and draw classic bounding boxes + labels scaled to the
+    // capture size.
+    var classifyOn by remember { mutableStateOf(false) }
+    var classifyBusy by remember { mutableStateOf(false) }
+    val classifyDets =
+        remember { mutableStateOf<List<YoloDetector.Detection>>(emptyList()) }
+    val classifyCaptureSize =
+        remember { mutableStateOf(Size.Zero) }
+    val classifyJob = remember { mutableStateOf<Job?>(null) }
+    val scope = rememberCoroutineScope()
+
+    fun rerunClassify() {
+        if (!classifyOn) return
+        classifyJob.value?.cancel()
+        classifyJob.value = scope.launch {
+            val w = mapView.width
+            val h = mapView.height
+            if (w <= 0 || h <= 0) return@launch
+            classifyBusy = true
+            // Snapshot the current rendered map (tiles + markers) on the
+            // main thread, then run inference off it.
+            val shot = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            mapView.draw(Canvas(shot))
+            val dets = withContext(Dispatchers.Default) {
+                YoloDetector.detect(shot)
+            }
+            classifyDets.value = dets
+            classifyCaptureSize.value = Size(w.toFloat(), h.toFloat())
+            classifyBusy = false
+            shot.recycle()
+        }
+    }
+
+    // Idempotent: safe to call when already off, or repeatedly (e.g. from
+    // zoom events that fire many times during one pinch).
+    fun disableClassify() {
+        if (!classifyOn) return
+        classifyOn = false
+        classifyJob.value?.cancel()
+        classifyJob.value = null
+        classifyBusy = false
+        classifyDets.value = emptyList()
+    }
+
+    fun toggleClassify() {
+        classifyOn = !classifyOn
+        if (classifyOn) {
+            YoloDetector.init(context)
+            rerunClassify()
+        } else {
+            disableClassify()
+        }
+    }
 
     fun saveCamera() {
         val c = mapView.mapCenter
+        zoomLevel = mapView.zoomLevelDouble
         onCameraChange(MapCamera(c.latitude, c.longitude, mapView.zoomLevelDouble))
     }
 
@@ -313,35 +401,63 @@ fun MapScreen(
         if (savedCamera != null) {
             mapView.controller.setZoom(savedCamera.zoom)
             mapView.controller.setCenter(GeoPoint(savedCamera.lat, savedCamera.lon))
+            zoomLevel = savedCamera.zoom
         }
     }
 
-    // Center on the device location when the map first shows, so a fresh
-    // install never sits on the default (0,0) ocean view. Without a saved
-    // camera or a requested drone: use any last-known position immediately,
-    // request a fresh fix, then center on the fix when it arrives. Centering
-    // happens once per map attach so later location updates never fight the
-    // user's view.
+    // Center the initial view on the most recently seen drone so the map
+    // opens where the action is. Only on a fresh install with no drone
+    // history do we fall back to the device location, centering on any known
+    // position immediately (never a blank view) then a fresh fix, unless the
+    // user has already moved the map.
     var centeredOnLocation by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         if (savedCamera == null && focusKey == null) {
-            LocationController.refresh(context)
-            LocationController.lastKnown(context)?.let { loc ->
-                if (!centeredOnLocation) {
-                    mapView.controller.setCenter(loc)
-                    mapView.controller.setZoom(INITIAL_ZOOM)
-                    centeredOnLocation = true
+            val lastDrone = allDrones.maxByOrNull { it.lastSeen }
+            if (lastDrone != null && isValidPosition(lastDrone.droneLat, lastDrone.droneLon)) {
+                mapView.controller.setCenter(GeoPoint(lastDrone.droneLat, lastDrone.droneLon))
+                mapView.controller.setZoom(INITIAL_ZOOM)
+                zoomLevel = INITIAL_ZOOM
+                centeredOnLocation = true
+            } else {
+                LocationController.lastKnown(context)?.let { loc ->
+                    if (!centeredOnLocation) {
+                        mapView.controller.setCenter(loc)
+                        mapView.controller.setZoom(INITIAL_ZOOM)
+                        zoomLevel = INITIAL_ZOOM
+                        centeredOnLocation = true
+                    }
                 }
+                LocationController.refresh(context)
             }
         }
     }
     LaunchedEffect(myLocation) {
-        if (!centeredOnLocation && myLocation != null &&
-            savedCamera == null && focusKey == null
+        if (!userMoved && myLocation != null &&
+            savedCamera == null && focusKey == null &&
+            allDrones.none { isValidPosition(it.droneLat, it.droneLon) }
         ) {
             mapView.controller.setCenter(myLocation!!)
             mapView.controller.setZoom(INITIAL_ZOOM)
+            zoomLevel = INITIAL_ZOOM
             centeredOnLocation = true
+        }
+    }
+
+    // The retained drone set loads from the DB after the map attaches. Once it
+    // arrives, prefer the most recently seen drone over the device location,
+    // unless the user has already moved the map.
+    LaunchedEffect(allDrones) {
+        if (!userMoved && savedCamera == null && focusKey == null &&
+            !centeredOnLocation
+        ) {
+            val lastDrone = allDrones.maxByOrNull { it.lastSeen }
+            if (lastDrone != null && isValidPosition(lastDrone.droneLat, lastDrone.droneLon)) {
+                mapView.controller.setCenter(GeoPoint(lastDrone.droneLat, lastDrone.droneLon))
+                mapView.controller.setZoom(INITIAL_ZOOM)
+                zoomLevel = INITIAL_ZOOM
+                centeredOnLocation = true
+            }
         }
     }
 
@@ -368,16 +484,23 @@ fun MapScreen(
             override fun onScroll(event: ScrollEvent): Boolean {
                 userMoved = true
                 saveCamera()
+                rerunClassify()
                 return false
             }
 
             override fun onZoom(event: ZoomEvent): Boolean {
                 userMoved = true
                 saveCamera()
+                // A zoom change invalidates any snapshot the boxes were drawn
+                // against; behave as if the classify-off button was pressed.
+                disableClassify()
                 return false
             }
         })
-        onDispose { mapView.onDetach() }
+        onDispose {
+            classifyJob.value?.cancel()
+            mapView.onDetach()
+        }
     }
 
     Box(modifier) {
@@ -396,6 +519,21 @@ fun MapScreen(
 
             for (d in drones) {
                 val stale = nowMs - d.lastSeen > STALE_MS
+
+                // Null-island coordinates (exact (0,0) or the small box around
+                // it) are the beacon's "no position known" sentinel. Suppress
+                // the marker and trail so a later real fix never draws a line
+                // from the ocean point to the actual location.
+                if (!isValidPosition(d.droneLat, d.droneLon)) {
+                    droneMarkers.remove(d.key)?.let { mapView.overlays.remove(it) }
+                    pilotMarkers.remove(d.key)?.let { mapView.overlays.remove(it) }
+                    lines.remove(d.key)?.let { mapView.overlays.remove(it) }
+                    trailLines.remove(d.key)?.let { mapView.overlays.remove(it) }
+                    trailCores.remove(d.key)?.let { mapView.overlays.remove(it) }
+                    droneIconKeys.remove(d.key)
+                    pilotIconKeys.remove(d.key)
+                    continue
+                }
 
                 // Thick white track with a dark casing (two stacked polylines)
                 // so it reads clearly on every base map and stays distinct
@@ -426,7 +564,9 @@ fun MapScreen(
                         mapView.overlays.add(this)
                     }
                 }
-                val trailPts = d.trail.map { GeoPoint(it.lat, it.lon) }
+                val trailPts = d.trail
+                    .filter { isValidPosition(it.lat, it.lon) }
+                    .map { GeoPoint(it.lat, it.lon) }
                 casing.setPoints(trailPts)
                 core.setPoints(trailPts)
 
@@ -452,7 +592,7 @@ fun MapScreen(
                 dm.title = d.basicId.ifBlank { d.mac }
                 dm.snippet = "alt ${d.droneAltitude}m  RSSI ${d.rssi}  MAC ${d.mac}"
 
-                if (d.pilotLat != 0.0 && d.pilotLon != 0.0) {
+                if (isValidPosition(d.pilotLat, d.pilotLon)) {
                     val pm = pilotMarkers.getOrPut(d.key) {
                         Marker(mapView).apply {
                             setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
@@ -498,6 +638,75 @@ fun MapScreen(
             mapView.invalidate()
         }
 
+        if (classifyOn) {
+            val textMeasurer = rememberTextMeasurer()
+            val labelStyle = TextStyle(
+                color = ComposeColor.White,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Canvas(Modifier.fillMaxSize()) {
+                val cs = classifyCaptureSize.value
+                if (cs.width > 0f && cs.height > 0f) {
+                    val sx = size.width / cs.width
+                    val sy = size.height / cs.height
+                    for (d in classifyDets.value) {
+                        // Defense in depth: never feed non-finite coords to
+                        // Compose (drawRect throws "Offset is unspecified").
+                        val corners = d.corners
+                        if (corners.any { !it.first.isFinite() || !it.second.isFinite() }) continue
+                        val color = ComposeColor(YoloDetector.boxColor(d))
+                        val pts = corners.map { (cx, cy) ->
+                            Offset(cx * cs.width * sx, cy * cs.height * sy)
+                        }
+                        val path = Path()
+                        path.moveTo(pts[0].x, pts[0].y)
+                        pts.drop(1).forEach { path.lineTo(it.x, it.y) }
+                        path.close()
+                        drawPath(path, color, style = Stroke(width = 3.dp.toPx()))
+                        // Label pinned at the top-most corner, clamped on-screen.
+                        val topPx = pts.minOf { it.y }
+                        val leftPx = pts.minOf { it.x }
+                        val label = "${d.className} ${(d.conf * 100).toInt()}%"
+                        val layout = textMeasurer.measure(
+                            AnnotatedString(label),
+                            style = labelStyle
+                        )
+                        val pad = 3.dp.toPx()
+                        val labelW = layout.size.width + 2 * pad
+                        val labelH = layout.size.height + 2 * pad
+                        val labelTop = (topPx - labelH).coerceAtLeast(0f)
+                        drawRect(
+                            color,
+                            topLeft = Offset(leftPx, labelTop),
+                            size = Size(labelW, labelH)
+                        )
+                        drawText(
+                            layout,
+                            topLeft = Offset(leftPx + pad, labelTop + pad)
+                        )
+                    }
+                }
+            }
+            if (classifyBusy) {
+                Surface(
+                    shape = MaterialTheme.shapes.medium,
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 3.dp,
+                    shadowElevation = 2.dp,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 8.dp)
+                ) {
+                    Text(
+                        "Classifying…",
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
+            }
+        }
+
         SmallFloatingActionButton(
             onClick = {
                 onStyleChange((mapStyle + 1) % MAP_STYLES.size)
@@ -507,6 +716,25 @@ fun MapScreen(
                 .padding(16.dp)
         ) {
             Icon(Icons.Filled.Layers, contentDescription = "Change map style")
+        }
+
+        // Zoom level chip, so detections can be compared at similar zoom.
+        Surface(
+            shape = MaterialTheme.shapes.medium,
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 3.dp,
+            shadowElevation = 2.dp,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(16.dp)
+        ) {
+            Text(
+                "Zoom %.1f".format(zoomLevel),
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary
+            )
         }
 
         SmallFloatingActionButton(
@@ -544,6 +772,32 @@ fun MapScreen(
             DroneGlyph(Modifier.size(24.dp))
         }
 
+        SmallFloatingActionButton(
+            onClick = { toggleClassify() },
+            containerColor = if (classifyOn) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.colorScheme.primaryContainer
+            },
+            contentColor = if (classifyOn) {
+                MaterialTheme.colorScheme.onPrimary
+            } else {
+                MaterialTheme.colorScheme.onPrimaryContainer
+            },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = 184.dp, end = 16.dp)
+        ) {
+            Icon(
+                Icons.Filled.AspectRatio,
+                contentDescription = if (classifyOn) {
+                    "Turn off classification"
+                } else {
+                    "Classify current view"
+                }
+            )
+        }
+
         Surface(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -562,29 +816,18 @@ fun MapScreen(
                         tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        "  History: ${
-                            if (historyScale == HISTORY_SCALE_ALL) "all"
-                            else historyLabel(historyMinutes)
-                        }",
+                        "  History: ${historyWindowLabel(historyMinutes, windowStartMs, windowEndMs)}",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                if (historyScale != HISTORY_SCALE_ALL) {
-                    Slider(
-                        value = historyMinutes.toFloat(),
-                        onValueChange = {
-                            onHistoryChange(it.toInt().coerceIn(0, historyMaxMinutes))
-                        },
-                        valueRange = 0f..historyMaxMinutes.toFloat()
-                    )
-                } else {
-                    Text(
-                        "Showing all retained history",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                Slider(
+                    value = historyMinutes.toFloat(),
+                    onValueChange = {
+                        onHistoryChange(it.toInt().coerceIn(0, historyMaxMinutes))
+                    },
+                    valueRange = 0f..historyMaxMinutes.toFloat()
+                )
             }
         }
     }

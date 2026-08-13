@@ -60,3 +60,20 @@ data class Drone(
     /** Timestamped position history (newest last) for trails/history. */
     val trail: List<TrailPoint> = emptyList()
 )
+
+/**
+ * Coordinates inside a small box around (0,0) are the "Gulf of Guinea"
+ * null-island glitch: sim/ADS-B data occasionally reports positions a few
+ * kilometers off the origin instead of exact (0,0). Treat them like the exact
+ * (0,0) "no position known" sentinel so a corrupt fix never draws a trail line
+ * out into the open ocean.
+ */
+const val NULL_ISLAND_DEG = 0.5
+
+/**
+ * True when [lat],[lon] are a real position. A corrupt fix can zero out only
+ * one axis (e.g. lat=25.78, lon=0.0), so a valid position requires BOTH
+ * coordinates away from the null-island box, not just one.
+ */
+fun isValidPosition(lat: Double, lon: Double): Boolean =
+    !(kotlin.math.abs(lat) < NULL_ISLAND_DEG || kotlin.math.abs(lon) < NULL_ISLAND_DEG)
