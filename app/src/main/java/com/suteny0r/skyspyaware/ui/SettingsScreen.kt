@@ -26,6 +26,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -59,6 +61,7 @@ fun SettingsScreen(vm: SkySpyViewModel) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var dbMsg by remember { mutableStateOf<String?>(null) }
+    var showSampleConfirm by remember { mutableStateOf(false) }
 
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
@@ -279,6 +282,45 @@ fun SettingsScreen(vm: SkySpyViewModel) {
             ) {
                 Text("Import DB")
             }
+        }
+        OutlinedButton(
+            onClick = { showSampleConfirm = true },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Load sample dataset")
+        }
+        Text(
+            text = "Large importable dataset for exercising analytics " +
+                "(bundled in the app). Loading replaces the current history.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+        )
+        if (showSampleConfirm) {
+            AlertDialog(
+                onDismissRequest = { showSampleConfirm = false },
+                title = { Text("Load sample dataset") },
+                text = {
+                    Text(
+                        "This replaces the current history database with the bundled " +
+                            "large sample dataset used for exercising analytics. The " +
+                            "existing history will be lost. Continue?"
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            showSampleConfirm = false
+                            scope.launch {
+                                val ok = vm.importBundledDataset("large-dataset/skyspy-detections.db")
+                                dbMsg = if (ok) "Sample dataset loaded" else "Load failed"
+                            }
+                        }
+                    ) { Text("Load") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showSampleConfirm = false }) { Text("Cancel") }
+                }
+            )
         }
         dbMsg?.let {
             Text(

@@ -32,6 +32,7 @@ fun ListScreen(
     simulatorKeys: Set<String> = emptySet(),
     platformKeys: Set<String> = emptySet(),
     satellite: Map<String, Map<String, Int>> = emptyMap(),
+    notes: Map<String, String> = emptyMap(),
     onSelect: (String) -> Unit,
     onReclassify: (String) -> Unit = {}
 ) {
@@ -47,9 +48,13 @@ fun ListScreen(
     }
     LazyColumn(Modifier.fillMaxSize()) {
         items(drones, key = { it.key }) { d ->
-            val (role, reason) = remember(d, satellite[d.key]) {
+            val (role, reason) = remember(d, satellite[d.key], notes[d.basicId.ifBlank { d.mac }]) {
                 val pts = d.trail.map { StatPoint(it.ts, it.lat, it.lon, d.droneAltitude) }
-                DroneClassifier.classify(pts, satellite[d.key] ?: emptyMap())
+                DroneClassifier.classify(
+                    pts,
+                    satellite[d.key] ?: emptyMap(),
+                    notes[d.basicId.ifBlank { d.mac }] ?: ""
+                )
             }
             Row(
                 Modifier
@@ -93,6 +98,16 @@ fun ListScreen(
                         fontWeight = FontWeight.Bold,
                         color = roleColor(role)
                     )
+                    val dkey = d.basicId.ifBlank { d.mac }
+                    val note = notes[dkey]
+                    if (!note.isNullOrBlank()) {
+                        Text(
+                            "Note: $note",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
                     Text(
                         reason,
                         style = MaterialTheme.typography.labelSmall,

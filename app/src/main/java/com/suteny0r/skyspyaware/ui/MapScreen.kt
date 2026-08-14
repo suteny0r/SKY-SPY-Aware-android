@@ -133,7 +133,7 @@ private fun altitudeColor(alt: Int): Int = when {
  * dp so they render consistently across screen densities. Stale drones (no
  * update in [STALE_MS]) render dimmed.
  */
-private object IconCache {
+object IconCache {
     private val bitmaps = HashMap<String, Bitmap>()
 
     fun drone(ctx: Context, altitude: Int, stale: Boolean): Bitmap {

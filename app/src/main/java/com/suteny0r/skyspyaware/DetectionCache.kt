@@ -10,6 +10,27 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 
+/** A persisted flight segment, derived at import from log boundary markers. */
+data class FlightRecord(
+    val key: String,
+    val startTs: Long,
+    val endTs: Long,
+    val startLat: Double,
+    val startLon: Double,
+    val endLat: Double,
+    val endLon: Double,
+    val distanceM: Double,
+    val nPoints: Int
+)
+
+/** A flight's full position series (used to draw its trail on a map). */
+data class FlightTrail(
+    val key: String,
+    val startTs: Long,
+    val endTs: Long,
+    val points: List<TrailPoint>
+)
+
 /** A cached detection row with its arrival timestamp. */
 data class CachedDetection(
     val ts: Long,
@@ -84,6 +105,23 @@ class DetectionCache(context: Context) {
                         pilotLon = c.getDouble(iPlon),
                         basicId = c.getString(iBid)
                     )
+                }
+            }
+        }
+        return out
+    }
+
+    /** All distinct, non-empty basic_ids ever seen, for background registration. */
+    fun distinctBasicIds(): Set<String> {
+        val out = HashSet<String>()
+        synchronized(lock) {
+            db.rawQuery(
+                "SELECT DISTINCT basic_id FROM detections",
+                null
+            ).use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getString(0) ?: ""
+                    if (id.isNotBlank()) out.add(id)
                 }
             }
         }
@@ -275,8 +313,281 @@ class DetectionCache(context: Context) {
         return out
     }
 
+    /** Position fixes for one drone within [fromTs, toTs] (a single flight). */
+    fun loadDroneTrail(key: String, fromTs: Long, toTs: Long): List<TrailPoint> {
+        val out = ArrayList<TrailPoint>()
+        synchronized(lock) {
+            db.query(
+                "detections",
+                arrayOf("ts", "drone_lat", "drone_lon"),
+                "(basic_id = ? OR (mac = ? AND (basic_id = '' OR basic_id IS NULL))) AND ts >= ? AND ts <= ?",
+                arrayOf(key, key, fromTs.toString(), toTs.toString()),
+                null, null, "ts ASC"
+            ).use { c ->
+                val iTs = c.getColumnIndexOrThrow("ts")
+                val iLat = c.getColumnIndexOrThrow("drone_lat")
+                val iLon = c.getColumnIndexOrThrow("drone_lon")
+                while (c.moveToNext()) {
+                    val lat = c.getDouble(iLat)
+                    val lon = c.getDouble(iLon)
+                    if (!isValidPosition(lat, lon)) continue
+                    out.add(TrailPoint(c.getLong(iTs), lat, lon))
+                }
+            }
+        }
+        return out
+    }
+
+    /** Full ordered trail plus pilot positions for one drone. */
+    fun loadDroneTrailWithPilot(key: String): List<TrailPointWithPilot> {
+        val out = ArrayList<TrailPointWithPilot>()
+        synchronized(lock) {
+            db.query(
+                "detections",
+                arrayOf("ts", "drone_lat", "drone_lon", "drone_alt", "pilot_lat", "pilot_lon"),
+                "basic_id = ? OR (mac = ? AND (basic_id = '' OR basic_id IS NULL))",
+                arrayOf(key, key),
+                null, null, "ts ASC"
+            ).use { c ->
+                val iTs = c.getColumnIndexOrThrow("ts")
+                val iLat = c.getColumnIndexOrThrow("drone_lat")
+                val iLon = c.getColumnIndexOrThrow("drone_lon")
+                val iAlt = c.getColumnIndexOrThrow("drone_alt")
+                val iPilLat = c.getColumnIndexOrThrow("pilot_lat")
+                val iPilLon = c.getColumnIndexOrThrow("pilot_lon")
+                while (c.moveToNext()) {
+                    val lat = c.getDouble(iLat)
+                    val lon = c.getDouble(iLon)
+                    if (!isValidPosition(lat, lon)) continue
+                    out.add(
+                        TrailPointWithPilot(
+                            c.getLong(iTs), lat, lon,
+                            c.getInt(iAlt),
+                            c.getDouble(iPilLat), c.getDouble(iPilLon)
+                        )
+                    )
+                }
+            }
+        }
+        return out
+    }
+
+    /** Trail plus pilot positions for one drone within [fromTs, toTs]. */
+    fun loadDroneTrailWithPilot(key: String, fromTs: Long, toTs: Long): List<TrailPointWithPilot> {
+        val out = ArrayList<TrailPointWithPilot>()
+        synchronized(lock) {
+            db.query(
+                "detections",
+                arrayOf("ts", "drone_lat", "drone_lon", "drone_alt", "pilot_lat", "pilot_lon"),
+                "(basic_id = ? OR (mac = ? AND (basic_id = '' OR basic_id IS NULL))) AND ts >= ? AND ts <= ?",
+                arrayOf(key, key, fromTs.toString(), toTs.toString()),
+                null, null, "ts ASC"
+            ).use { c ->
+                val iTs = c.getColumnIndexOrThrow("ts")
+                val iLat = c.getColumnIndexOrThrow("drone_lat")
+                val iLon = c.getColumnIndexOrThrow("drone_lon")
+                val iAlt = c.getColumnIndexOrThrow("drone_alt")
+                val iPilLat = c.getColumnIndexOrThrow("pilot_lat")
+                val iPilLon = c.getColumnIndexOrThrow("pilot_lon")
+                while (c.moveToNext()) {
+                    val lat = c.getDouble(iLat)
+                    val lon = c.getDouble(iLon)
+                    if (!isValidPosition(lat, lon)) continue
+                    out.add(
+                        TrailPointWithPilot(
+                            c.getLong(iTs), lat, lon,
+                            c.getInt(iAlt),
+                            c.getDouble(iPilLat), c.getDouble(iPilLon)
+                        )
+                    )
+                }
+            }
+        }
+        return out
+    }
+
+    /** All persisted flight segments, newest first. Empty if no flights table. */
+    fun loadFlights(): List<FlightRecord> {
+        val out = ArrayList<FlightRecord>()
+        synchronized(lock) {
+            try {
+                db.query(
+                    "flights",
+                    arrayOf(
+                        "key", "start_ts", "end_ts", "start_lat", "start_lon",
+                        "end_lat", "end_lon", "distance_m", "n_points"
+                    ),
+                    null, null, null, null, "start_ts DESC"
+                ).use { c ->
+                    val iKey = c.getColumnIndexOrThrow("key")
+                    val iStart = c.getColumnIndexOrThrow("start_ts")
+                    val iEnd = c.getColumnIndexOrThrow("end_ts")
+                    val iSLat = c.getColumnIndexOrThrow("start_lat")
+                    val iSLon = c.getColumnIndexOrThrow("start_lon")
+                    val iELat = c.getColumnIndexOrThrow("end_lat")
+                    val iELon = c.getColumnIndexOrThrow("end_lon")
+                    val iDist = c.getColumnIndexOrThrow("distance_m")
+                    val iN = c.getColumnIndexOrThrow("n_points")
+                    while (c.moveToNext()) {
+                        out.add(
+                            FlightRecord(
+                                c.getString(iKey),
+                                c.getLong(iStart),
+                                c.getLong(iEnd),
+                                c.getDouble(iSLat),
+                                c.getDouble(iSLon),
+                                c.getDouble(iELat),
+                                c.getDouble(iELon),
+                                c.getDouble(iDist),
+                                c.getInt(iN)
+                            )
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                // flights table missing in an older DB: fall back to gap-based.
+            }
+        }
+        return out
+    }
+
+    /**
+     * All flight trails across every drone, one entry per flight segment.
+     * A flight is a continuous run of fixes for one key separated by more than
+     * [gapMs]. Used by the Flights tab "All" view to overlay every trail.
+     */
+    fun loadAllFlightTrails(gapMs: Long = 5 * 60 * 1000L): List<FlightTrail> {
+        val byKey = LinkedHashMap<String, MutableList<TrailPoint>>()
+        synchronized(lock) {
+            db.query(
+                "detections",
+                arrayOf("ts", "basic_id", "mac", "drone_lat", "drone_lon"),
+                null, null, null, null, "ts ASC"
+            ).use { c ->
+                val iTs = c.getColumnIndexOrThrow("ts")
+                val iBid = c.getColumnIndexOrThrow("basic_id")
+                val iMac = c.getColumnIndexOrThrow("mac")
+                val iLat = c.getColumnIndexOrThrow("drone_lat")
+                val iLon = c.getColumnIndexOrThrow("drone_lon")
+                while (c.moveToNext()) {
+                    val lat = c.getDouble(iLat)
+                    val lon = c.getDouble(iLon)
+                    if (!isValidPosition(lat, lon)) continue
+                    val bid = c.getString(iBid)
+                    val mac = c.getString(iMac)
+                    val key = if (!bid.isNullOrBlank()) bid else mac ?: ""
+                    if (key.isEmpty()) continue
+                    byKey.getOrPut(key) { mutableListOf() }
+                        .add(TrailPoint(c.getLong(iTs), lat, lon))
+                }
+            }
+        }
+        val out = ArrayList<FlightTrail>()
+        for ((key, pts) in byKey) {
+            pts.sortBy { it.ts }
+            var segStart = 0
+            for (i in 1..pts.size) {
+                if (i == pts.size || pts[i].ts - pts[i - 1].ts > gapMs) {
+                    val seg = pts.subList(segStart, i)
+                    if (seg.size >= 2) {
+                        out.add(
+                            FlightTrail(
+                                key = key,
+                                startTs = seg.first().ts,
+                                endTs = seg.last().ts,
+                                points = seg.toList()
+                            )
+                        )
+                    }
+                    segStart = i
+                }
+            }
+        }
+        out.sortByDescending { it.startTs }
+        return out
+    }
+
+    /** All persisted notes (drone key -> note). Empty map if table missing. */
+    fun loadDroneNotes(): Map<String, String> {
+        val out = HashMap<String, String>()
+        synchronized(lock) {
+            try {
+                db.query("drone_notes", arrayOf("key", "note"), null, null, null, null, null).use { c ->
+                    val iKey = c.getColumnIndexOrThrow("key")
+                    val iNote = c.getColumnIndexOrThrow("note")
+                    while (c.moveToNext()) out[c.getString(iKey)] = c.getString(iNote)
+                }
+            } catch (_: Exception) {
+                // drone_notes table missing in an older DB.
+            }
+        }
+        return out
+    }
+
+    /** Save (or replace) a note for one drone. */
+    fun saveDroneNote(key: String, note: String) {
+        val v = ContentValues().apply {
+            put("key", key)
+            put("note", note)
+            put("updated_ts", System.currentTimeMillis())
+        }
+        synchronized(lock) {
+            try {
+                db.insertWithOnConflict(
+                    "drone_notes", null, v, SQLiteDatabase.CONFLICT_REPLACE
+                )
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** Remove any saved note for one drone. */
+    fun clearDroneNote(key: String) {
+        synchronized(lock) {
+            try {
+                db.delete("drone_notes", "key = ?", arrayOf(key))
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** Remember a note value globally (shared prefill history for all drones). */
+    fun recordNoteHistory(note: String) {
+        val v = ContentValues().apply {
+            put("note", note)
+            put("updated_ts", System.currentTimeMillis())
+        }
+        synchronized(lock) {
+            try {
+                db.insertWithOnConflict(
+                    "note_history", null, v, SQLiteDatabase.CONFLICT_REPLACE
+                )
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** Most-recently-used note values (global prefills), newest first. */
+    fun loadNoteSuggestions(limit: Int): List<String> {
+        val out = ArrayList<String>()
+        synchronized(lock) {
+            try {
+                db.query(
+                    "note_history", arrayOf("note"),
+                    null, null, null, null, "updated_ts DESC", limit.toString()
+                ).use { c ->
+                    val iNote = c.getColumnIndexOrThrow("note")
+                    while (c.moveToNext()) out.add(c.getString(iNote))
+                }
+            } catch (_: Exception) {
+                // note_history table missing in an older DB.
+            }
+        }
+        return out
+    }
+
     private class DetectionDb(context: Context) :
-        SQLiteOpenHelper(context, "detections.db", null, 4) {
+        SQLiteOpenHelper(context, "detections.db", null, 7) {
 
         override fun onCreate(db: SQLiteDatabase) {
             db.execSQL(
@@ -299,6 +610,32 @@ class DetectionCache(context: Context) {
                 "CREATE TABLE satellite_cache (" +
                     "drone_key TEXT PRIMARY KEY, counts TEXT, ts INTEGER)"
             )
+            db.execSQL(
+                "CREATE TABLE flights (" +
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT," +
+                    "key TEXT NOT NULL," +
+                    "start_ts INTEGER," +
+                    "end_ts INTEGER," +
+                    "start_lat REAL," +
+                    "start_lon REAL," +
+                    "end_lat REAL," +
+                    "end_lon REAL," +
+                    "distance_m REAL," +
+                    "n_points INTEGER)"
+            )
+            db.execSQL("CREATE INDEX idx_flights_key ON flights(key)")
+            db.execSQL("CREATE INDEX idx_flights_start ON flights(start_ts)")
+            db.execSQL(
+                "CREATE TABLE drone_notes (" +
+                    "key TEXT PRIMARY KEY," +
+                    "note TEXT NOT NULL," +
+                    "updated_ts INTEGER)"
+            )
+            db.execSQL(
+                "CREATE TABLE note_history (" +
+                    "note TEXT PRIMARY KEY," +
+                    "updated_ts INTEGER)"
+            )
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -311,6 +648,38 @@ class DetectionCache(context: Context) {
                 db.execSQL(
                     "CREATE TABLE satellite_cache (" +
                         "drone_key TEXT PRIMARY KEY, counts TEXT, ts INTEGER)"
+                )
+            }
+            if (oldVersion < 5) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS flights (" +
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT," +
+                        "key TEXT NOT NULL," +
+                        "start_ts INTEGER," +
+                        "end_ts INTEGER," +
+                        "start_lat REAL," +
+                        "start_lon REAL," +
+                        "end_lat REAL," +
+                        "end_lon REAL," +
+                        "distance_m REAL," +
+                        "n_points INTEGER)"
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS idx_flights_key ON flights(key)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS idx_flights_start ON flights(start_ts)")
+            }
+            if (oldVersion < 6) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS drone_notes (" +
+                        "key TEXT PRIMARY KEY," +
+                        "note TEXT NOT NULL," +
+                        "updated_ts INTEGER)"
+                )
+            }
+            if (oldVersion < 7) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS note_history (" +
+                        "note TEXT PRIMARY KEY," +
+                        "updated_ts INTEGER)"
                 )
             }
         }

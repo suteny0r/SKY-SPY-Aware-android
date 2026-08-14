@@ -8,10 +8,17 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.suteny0r.skyspyaware.Drone
@@ -24,6 +31,8 @@ fun DroneDetail(
     d: Drone,
     faa: String?,
     platform: String? = null,
+    note: String = "",
+    onNoteChange: ((String) -> Unit)? = null,
     onShowFlights: (() -> Unit)? = null
 ) {
     Column(
@@ -50,6 +59,14 @@ fun DroneDetail(
                 style = MaterialTheme.typography.labelMedium,
                 fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
                 color = MaterialTheme.colorScheme.tertiary
+            )
+        }
+        if (note.isNotBlank()) {
+            Text(
+                "Note: $note",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary
             )
         }
         Spacer(Modifier.height(12.dp))
@@ -86,6 +103,37 @@ fun DroneDetail(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("Show all flights on map")
+            }
+            Spacer(Modifier.height(16.dp))
+        }
+
+        onNoteChange?.let { save ->
+            var noteText by remember(note) { mutableStateOf(note) }
+            OutlinedTextField(
+                value = noteText,
+                onValueChange = { noteText = it },
+                label = { Text("Note (e.g. coast guard)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(
+                Modifier.fillMaxWidth().padding(top = 4.dp),
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = { save(noteText) },
+                    enabled = noteText.trim() != note
+                ) {
+                    Text("Save note")
+                }
+                if (note.isNotBlank()) {
+                    TextButton(
+                        onClick = { noteText = ""; save("") },
+                        modifier = Modifier.padding(start = 8.dp)
+                    ) {
+                        Text("Clear")
+                    }
+                }
             }
             Spacer(Modifier.height(16.dp))
         }

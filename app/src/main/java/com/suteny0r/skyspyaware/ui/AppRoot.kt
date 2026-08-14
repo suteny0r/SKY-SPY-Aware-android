@@ -12,6 +12,8 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.BarChart
+import androidx.compose.material.icons.filled.Category
+import androidx.compose.material.icons.filled.Flight
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.Settings
@@ -36,6 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.suteny0r.skyspyaware.FAA_NOT_FOUND
+import com.suteny0r.skyspyaware.FlightSummary
 import com.suteny0r.skyspyaware.SkySpyViewModel
 import kotlinx.coroutines.launch
 
@@ -50,6 +53,7 @@ fun AppRoot(vm: SkySpyViewModel) {
     val faa by vm.faa.collectAsState()
     val faaPlatform by vm.faaPlatform.collectAsState()
     val satellite by vm.satellite.collectAsState()
+    val notes by vm.droneNotes.collectAsState()
 
     var mapCamera by remember { mutableStateOf<MapCamera?>(null) }
     var mapStyle by remember { mutableStateOf(vm.getMapStyle().coerceIn(0, MAP_STYLES.lastIndex)) }
@@ -57,6 +61,12 @@ fun AppRoot(vm: SkySpyViewModel) {
     var focusKey by remember { mutableStateOf<String?>(null) }
     var focusTick by remember { mutableStateOf(0) }
     var flightMapKey by remember { mutableStateOf<String?>(null) }
+    var selectedFlight by remember { mutableStateOf<FlightSummary?>(null) }
+
+    // Hoisted so the Drone models tree keeps its expand state while the
+    // flight map trail (which replaces the tab content) is shown.
+    var expandedModels by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var expandedDrones by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     val selectedDrone = drones.firstOrNull { it.key == selectedKey }
 
@@ -112,10 +122,16 @@ fun AppRoot(vm: SkySpyViewModel) {
     }
 
     val flightsKey = flightMapKey
-    if (flightsKey != null) {
-        DroneFlightsScreen(vm, flightsKey, onBack = { flightMapKey = null })
-    } else {
-    Scaffold(
+    val openFlight = selectedFlight
+    when {
+        openFlight != null -> DroneFlightsScreen(
+            vm,
+            openFlight.droneKey,
+            onBack = { selectedFlight = null },
+            window = openFlight.startTs to openFlight.endTs
+        )
+        flightsKey != null -> DroneFlightsScreen(vm, flightsKey, onBack = { flightMapKey = null })
+        else -> Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("SKY-SPY-Aware") },
@@ -158,6 +174,18 @@ fun AppRoot(vm: SkySpyViewModel) {
                     onClick = { tab = 4 },
                     icon = { Icon(Icons.Filled.BarChart, contentDescription = "Statistics") },
                     label = { Text("Stats") }
+                )
+                NavigationBarItem(
+                    selected = tab == 5,
+                    onClick = { tab = 5 },
+                    icon = { Icon(Icons.Filled.Category, contentDescription = "Drone inventory") },
+                    label = { Text("Drones") }
+                )
+                NavigationBarItem(
+                    selected = tab == 6,
+                    onClick = { tab = 6 },
+                    icon = { Icon(Icons.Filled.Flight, contentDescription = "Flights") },
+                    label = { Text("Flights") }
                 )
             }
         }
@@ -224,10 +252,13 @@ fun AppRoot(vm: SkySpyViewModel) {
                                     state = pagerState,
                                     modifier = Modifier.fillMaxSize()
                                 ) { page ->
+                                    val dk = list[page].basicId.ifBlank { list[page].mac }
                                     DroneDetail(
                                         list[page],
                                         faa[list[page].basicId],
                                         faaPlatform[list[page].basicId],
+                                        note = notes[dk] ?: "",
+                                        onNoteChange = { vm.setDroneNote(dk, it) },
                                         onShowFlights = { flightMapKey = list[page].key }
                                     )
                                 }
@@ -249,10 +280,13 @@ fun AppRoot(vm: SkySpyViewModel) {
                                         Text("List", modifier = Modifier.padding(start = 4.dp))
                                     }
                                 }
+                                val dk = selectedDrone.basicId.ifBlank { selectedDrone.mac }
                                 DroneDetail(
                                     selectedDrone,
                                     faa[selectedDrone.basicId],
                                     faaPlatform[selectedDrone.basicId],
+                                    note = notes[dk] ?: "",
+                                    onNoteChange = { vm.setDroneNote(dk, it) },
                                     onShowFlights = { flightMapKey = selectedDrone.key }
                                 )
                             }
@@ -262,6 +296,7 @@ fun AppRoot(vm: SkySpyViewModel) {
                             simulatorKeys = simulatorKeys,
                             platformKeys = platformKeys,
                             satellite = satellite,
+                            notes = notes,
                             onSelect = { key -> select(key) },
                             onReclassify = { key ->
                                 scope.launch {
@@ -277,6 +312,22 @@ fun AppRoot(vm: SkySpyViewModel) {
                 2 -> ConsoleScreen(console)
                 3 -> SettingsScreen(vm)
                 4 -> StatsScreen(vm, onSelect = { key -> select(key) })
+                5 -> DroneStatsScreen(
+                    vm,
+                    onSelect = { key -> select(key) },
+                    onShowFlight = { selectedFlight = it },
+                    onShowDroneTrail = { flightMapKey = it },
+                    notes = notes,
+                    expandedModels = expandedModels,
+                    onModelToggle = { model ->
+                        expandedModels = if (model in expandedModels) expandedModels - model else expandedModels + model
+                    },
+                    expandedDrones = expandedDrones,
+                    onDroneToggle = { key ->
+                        expandedDrones = if (key in expandedDrones) expandedDrones - key else expandedDrones + key
+                    }
+                )
+                6 -> FlightsScreen(vm, onSelectFlight = { selectedFlight = it })
             }
         }
     }

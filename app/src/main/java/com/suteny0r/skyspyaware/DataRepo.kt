@@ -59,11 +59,29 @@ data class HistoryStats(val count: Long, val drones: Long, val bytes: Long)
  */
 object DataRepo {
 
+    /**
+     * True when an FAA lookup result means "no registration on file", i.e. the
+     * drone is treated as simulator traffic. Any row whose remote-id serial
+     * returns no such record in the FCC/FAA registry is simulator data and is
+     * excluded from real-world statistics. Both the canonical sentinel and the
+     * legacy "No registration data" text are accepted so already-cached lookups
+     * are honoured.
+     */
+    private fun isSimulator(result: String?): Boolean {
+        if (result == null) return false
+        if (result == FAA_NOT_FOUND) return true
+        val r = result.lowercase()
+        return "no registration" in r || "not found" in r || "no such" in r
+    }
+
     private const val CONSOLE_LIMIT = 500
     private const val TRAIL_MAX = 20000
     private const val PRUNE_INTERVAL_MS = 60L * 60 * 1000
     private const val FAA_RETRY_POLL_MS = 60_000L
     private const val FAA_LOOKUP_INTERVAL_MS = 5_000L
+    private const val STATS_RECOMPUTE_DEBOUNCE_MS = 2500L
+    private val statsRecomputeLock = Any()
+    private var statsRecomputeScheduled = false
     private const val SATELLITE_TTL_MS = 24L * 60 * 60 * 1000
     private const val FLIGHT_QUIET_MS = 150_000L   // 2.5 min without a fix = flight over
     private const val FLIGHT_CLASSIFY_POLL_MS = 30_000L
@@ -118,6 +136,15 @@ object DataRepo {
     private val _stats = MutableStateFlow<Statistics?>(null)
     val stats: StateFlow<Statistics?> = _stats.asStateFlow()
 
+    private val _flights = MutableStateFlow<List<FlightSummary>>(emptyList())
+    val flights: StateFlow<List<FlightSummary>> = _flights.asStateFlow()
+
+    private val _droneNotes = MutableStateFlow<Map<String, String>>(emptyMap())
+    val droneNotes: StateFlow<Map<String, String>> = _droneNotes.asStateFlow()
+
+    private val _noteSuggestions = MutableStateFlow<List<String>>(emptyList())
+    val noteSuggestions: StateFlow<List<String>> = _noteSuggestions.asStateFlow()
+
     private val _faaPlatform = MutableStateFlow<Map<String, String>>(emptyMap())
     val faaPlatform: StateFlow<Map<String, String>> = _faaPlatform.asStateFlow()
 
@@ -160,6 +187,16 @@ object DataRepo {
         }
         _historyMinutes.value = settingsRepo.getHistoryMinutes()
         _autoPruneScale.value = settingsRepo.getAutoPruneScale()
+        _droneNotes.value = try {
+            cache.loadDroneNotes()
+        } catch (_: Exception) {
+            emptyMap()
+        }
+        _noteSuggestions.value = try {
+            cache.loadNoteSuggestions(12)
+        } catch (_: Exception) {
+            emptyList()
+        }
         mqtt.onLine = { line -> handleLine(line) }
         ageJob = scope.launch {
             while (isActive) {
@@ -458,8 +495,27 @@ object DataRepo {
                 }
                 _faa.value = HashMap(faaCache)
                 _faaPlatform.value = HashMap(faaPlatformLabels)
+                // A definitive result (model resolved, or no-registration ->
+                // simulator) changes the drone inventory, so recompute stats
+                // on a short debounce so the Drones/Flights tabs stay current
+                // as the background lookup crawl progresses.
+                scheduleStatsRecompute()
                 delay(FAA_LOOKUP_INTERVAL_MS)
             }
+        }
+    }
+
+    /** Debounced recompute so FAA lookups (models + simulator tagging) surface
+     *  in the stats without reopening the tab. */
+    private fun scheduleStatsRecompute() {
+        synchronized(statsRecomputeLock) {
+            if (statsRecomputeScheduled) return
+            statsRecomputeScheduled = true
+        }
+        cacheScope.launch {
+            delay(STATS_RECOMPUTE_DEBOUNCE_MS)
+            synchronized(statsRecomputeLock) { statsRecomputeScheduled = false }
+            computeStats(emitFlights = true)
         }
     }
 
@@ -643,7 +699,39 @@ object DataRepo {
         cacheScope.launch {
             computeStats()
             satellitePass()
-            computeStats()
+            computeStats(emitFlights = true)
+        }
+    }
+
+    /** Recompute just the flight list from full history (used by the Flights tab). */
+    fun refreshFlights() {
+        cacheScope.launch {
+            val faaText = synchronized(faaCache) { HashMap(faaCache) }
+            try {
+                cache.distinctBasicIds().forEach { enqueueFaaLookup(it) }
+            } catch (_: Exception) {
+            }
+            val dbFlights = try {
+                cache.loadFlights()
+            } catch (_: Exception) {
+                emptyList()
+            }
+            _flights.value = if (dbFlights.isNotEmpty()) {
+                val simulatorKeys = synchronized(faaCache) {
+                    faaCache.filterValues { isSimulator(it) }.keys.toSet()
+                }
+                StatisticsCalculator.flightsFromDb(dbFlights, faaText, simulatorKeys)
+            } else {
+                val rows = try {
+                    cache.loadSince(0L)
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                val simulatorKeys = synchronized(faaCache) {
+                    faaCache.filterValues { isSimulator(it) }.keys.toSet()
+                }
+                StatisticsCalculator.computeFlights(rows, simulatorKeys, faaText)
+            }
         }
     }
 
@@ -651,7 +739,7 @@ object DataRepo {
      *  triggered repeatedly by applySatelliteScan / classifyCompletedFlights). */
     private val satellitePassBusy = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    private suspend fun computeStats() {
+    private suspend fun computeStats(emitFlights: Boolean = false) {
         val rows = try {
             cache.loadSince(0L)
         } catch (_: Exception) {
@@ -660,13 +748,36 @@ object DataRepo {
         // Simulator drones are identified by basicIds that fail the FAA
         // registration lookup.
         val simulatorKeys = synchronized(faaCache) {
-            faaCache.filterValues { it == FAA_NOT_FOUND }.keys.toSet()
+            faaCache.filterValues { isSimulator(it) }.keys.toSet()
         }
+        val faaText = synchronized(faaCache) { HashMap(faaCache) }
         val sat = synchronized(satelliteCounts) { HashMap(satelliteCounts) }
+        // Enqueue registration lookups for every basic_id in history so the
+        // stats make/model attribution fills in over time, even for drones
+        // outside the current map window. The FAA worker throttles to one
+        // request every few seconds, so this is a slow background crawl.
+        try {
+            cache.distinctBasicIds().forEach { enqueueFaaLookup(it) }
+        } catch (_: Exception) {
+        }
         _stats.value = try {
-            StatisticsCalculator.compute(rows, simulatorKeys, sat)
+            StatisticsCalculator.compute(
+                rows, simulatorKeys, sat, faaText, _droneNotes.value
+            )
         } catch (_: Exception) {
             null
+        }
+        if (emitFlights) {
+            val dbFlights = try {
+                cache.loadFlights()
+            } catch (_: Exception) {
+                emptyList()
+            }
+            _flights.value = if (dbFlights.isNotEmpty()) {
+                StatisticsCalculator.flightsFromDb(dbFlights, faaText, simulatorKeys)
+            } else {
+                StatisticsCalculator.computeFlights(rows, simulatorKeys, faaText)
+            }
         }
     }
 
@@ -747,10 +858,90 @@ object DataRepo {
         ok
     }
 
+    /**
+     * Load a database bundled in the APK assets (e.g. a large sample dataset
+     * for exercising analytics). Replaces the on-device history like an import.
+     */
+    suspend fun importBundledDataset(assetName: String): Boolean = withContext(Dispatchers.IO) {
+        val ok = try {
+            appContext.assets.open(assetName).use { cache.importFrom(it) }
+        } catch (_: Exception) {
+            false
+        }
+        if (ok) rebuildAll()
+        ok
+    }
+
     /** Full ordered flight trail for one drone from the entire database. */
     suspend fun loadDroneFlights(key: String): List<TrailPoint> = withContext(Dispatchers.IO) {
         try {
             cache.loadDroneTrail(key)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /** Position fixes for one drone within a time window (a single flight). */
+    suspend fun loadDroneFlights(key: String, fromTs: Long, toTs: Long): List<TrailPoint> =
+        withContext(Dispatchers.IO) {
+            try {
+                cache.loadDroneTrail(key, fromTs, toTs)
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+    /** Full ordered trail plus pilot positions for one drone. */
+    suspend fun loadDroneFlightsWithPilot(key: String): List<TrailPointWithPilot> =
+        withContext(Dispatchers.IO) {
+            try {
+                cache.loadDroneTrailWithPilot(key)
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+    /** Trail plus pilot positions for one drone within a time window. */
+    suspend fun loadDroneFlightsWithPilot(
+        key: String,
+        fromTs: Long,
+        toTs: Long
+    ): List<TrailPointWithPilot> = withContext(Dispatchers.IO) {
+        try {
+            cache.loadDroneTrailWithPilot(key, fromTs, toTs)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /** Every flight trail across all drones (for the Flights tab "All" view). */
+    suspend fun loadAllTrails(): List<FlightTrail> = withContext(Dispatchers.IO) {
+        try {
+            cache.loadAllFlightTrails()
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /** Persist a note for a drone; an empty/blank note clears it. */
+    fun setDroneNote(key: String, note: String) {
+        val trimmed = note.trim()
+        try {
+            if (trimmed.isEmpty()) {
+                cache.clearDroneNote(key)
+            } else {
+                cache.saveDroneNote(key, trimmed)
+                cache.recordNoteHistory(trimmed)
+            }
+        } catch (_: Exception) {
+        }
+        _droneNotes.value = try {
+            cache.loadDroneNotes()
+        } catch (_: Exception) {
+            emptyMap()
+        }
+        _noteSuggestions.value = try {
+            cache.loadNoteSuggestions(12)
         } catch (_: Exception) {
             emptyList()
         }

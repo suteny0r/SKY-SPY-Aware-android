@@ -42,6 +42,16 @@ object DetectionParser {
 /** A timestamped position point for trail/history rendering. */
 data class TrailPoint(val ts: Long, val lat: Double, val lon: Double)
 
+/** A timestamped drone position paired with the pilot's position at that fix. */
+data class TrailPointWithPilot(
+    val ts: Long,
+    val lat: Double,
+    val lon: Double,
+    val alt: Int,
+    val pilotLat: Double,
+    val pilotLon: Double
+)
+
 /** Current state of a tracked drone. */
 data class Drone(
     val key: String,

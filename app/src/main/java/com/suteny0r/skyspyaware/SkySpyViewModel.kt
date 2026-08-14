@@ -32,6 +32,9 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
     val pendingSelection: StateFlow<String?> = DataRepo.pendingSelection
     val historyStats: StateFlow<HistoryStats> = DataRepo.historyStats
     val stats: StateFlow<Statistics?> = DataRepo.stats
+    val flights: StateFlow<List<FlightSummary>> = DataRepo.flights
+    val droneNotes: StateFlow<Map<String, String>> = DataRepo.droneNotes
+    val noteSuggestions: StateFlow<List<String>> = DataRepo.noteSuggestions
 
     fun connect() = DataRepo.startCollecting(getApplication())
     fun disconnect() = DataRepo.stopCollecting(getApplication())
@@ -47,12 +50,25 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
     fun consumePendingSelection() = DataRepo.consumePendingSelection()
     fun refreshHistoryStats() = DataRepo.refreshHistoryStats()
     fun refreshStats() = DataRepo.refreshStats()
+    fun refreshFlights() = DataRepo.refreshFlights()
     fun purgeHistory() = DataRepo.purgeHistory()
     suspend fun exportHistory(out: OutputStream): Boolean = DataRepo.exportHistory(out)
     suspend fun importHistory(input: InputStream): Boolean = DataRepo.importHistory(input)
+
+    suspend fun importBundledDataset(assetName: String): Boolean = DataRepo.importBundledDataset(assetName)
     suspend fun loadDroneFlights(key: String): List<TrailPoint> = DataRepo.loadDroneFlights(key)
+    suspend fun loadDroneFlights(key: String, fromTs: Long, toTs: Long): List<TrailPoint> =
+        DataRepo.loadDroneFlights(key, fromTs, toTs)
+    suspend fun loadDroneFlightsWithPilot(key: String): List<TrailPointWithPilot> =
+        DataRepo.loadDroneFlightsWithPilot(key)
+    suspend fun loadDroneFlightsWithPilot(
+        key: String,
+        fromTs: Long,
+        toTs: Long
+    ): List<TrailPointWithPilot> = DataRepo.loadDroneFlightsWithPilot(key, fromTs, toTs)
     fun applySatelliteScan(key: String, counts: Map<String, Int>) =
         DataRepo.applySatelliteScan(key, counts)
+    fun setDroneNote(key: String, note: String) = DataRepo.setDroneNote(key, note)
     suspend fun reclassify(key: String): Map<String, Int>? =
         DataRepo.reclassify(getApplication(), key)
 }

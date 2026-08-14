@@ -35,8 +35,10 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import com.suteny0r.skyspyaware.SatelliteAnalyzer
 import com.suteny0r.skyspyaware.SkySpyViewModel
-import com.suteny0r.skyspyaware.TrailPoint
+import com.suteny0r.skyspyaware.TrailPointWithPilot
 import com.suteny0r.skyspyaware.YoloDetector
+import com.suteny0r.skyspyaware.isValidPosition
+import java.util.Date
 import kotlinx.coroutines.launch
 import org.osmdroid.util.BoundingBox
 import org.osmdroid.util.GeoPoint
@@ -48,17 +50,25 @@ import org.osmdroid.views.overlay.Polyline
 
 private const val SCAN_BOX_TITLE = "scan_box"
 private const val SCAN_BOX_LABEL_PREFIX = "scan_label:"
+private const val FLIGHT_GAP_MS = 5 * 60 * 1000L
+
+private val FLIGHT_DATE = java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.US)
 
 /**
  * Full-history map for one drone. Loads every position fix from the database
  * and lets the user scrub a time slider across the entire span of its flights.
  */
 @Composable
-fun DroneFlightsScreen(vm: SkySpyViewModel, droneKey: String, onBack: () -> Unit) {
+fun DroneFlightsScreen(
+    vm: SkySpyViewModel,
+    droneKey: String,
+    onBack: () -> Unit,
+    window: Pair<Long, Long>? = null
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    var trail by remember { mutableStateOf<List<TrailPoint>>(emptyList()) }
+    var trail by remember { mutableStateOf<List<TrailPointWithPilot>>(emptyList()) }
     var loaded by remember { mutableStateOf(false) }
     var firstTs by remember { mutableStateOf(0L) }
     var maxMinutes by remember { mutableStateOf(1f) }
@@ -67,14 +77,18 @@ fun DroneFlightsScreen(vm: SkySpyViewModel, droneKey: String, onBack: () -> Unit
     var scanCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     var scanBoxes by remember { mutableStateOf<List<SatelliteAnalyzer.ScanBox>>(emptyList()) }
 
-    LaunchedEffect(droneKey) {
-        val t = vm.loadDroneFlights(droneKey)
+    LaunchedEffect(droneKey, window) {
+        val t = if (window != null) {
+            vm.loadDroneFlightsWithPilot(droneKey, window.first, window.second)
+        } else {
+            vm.loadDroneFlightsWithPilot(droneKey)
+        }
         trail = t
         if (t.isNotEmpty()) {
             firstTs = t.first().ts
             val last = t.last().ts
             maxMinutes = ((last - firstTs) / 60_000.0).toFloat().coerceAtLeast(1f)
-            sliderMinutes = maxMinutes
+            sliderMinutes = 0f
         }
         loaded = true
     }
@@ -151,44 +165,101 @@ fun DroneFlightsScreen(vm: SkySpyViewModel, droneKey: String, onBack: () -> Unit
         mapView.invalidate()
     }
 
-    // Fit the camera once to the full flight footprint; never move it again
-    // as the slider trims the visible trail.
+    // Fit the camera once to the full flight footprint plus the pilot's
+    // position(s) (plus a 20% border so nothing is clipped at the screen
+    // edges); never move it again as the slider trims the visible trail.
     LaunchedEffect(loaded, trail) {
         if (!loaded || trail.isEmpty()) return@LaunchedEffect
-        val allPts = trail.map { GeoPoint(it.lat, it.lon) }
+        val allPts = ArrayList<GeoPoint>()
+        for (p in trail) {
+            allPts.add(GeoPoint(p.lat, p.lon))
+            if (isValidPosition(p.pilotLat, p.pilotLon)) {
+                allPts.add(GeoPoint(p.pilotLat, p.pilotLon))
+            }
+        }
         if (allPts.size > 1) {
-            mapView.zoomToBoundingBox(BoundingBox.fromGeoPoints(allPts), false, 80)
+            val tight = BoundingBox.fromGeoPoints(allPts)
+            val latSpan = tight.latNorth - tight.latSouth
+            val lonSpan = tight.lonEast - tight.lonWest
+            val padded = BoundingBox(
+                tight.latNorth + latSpan * 0.2,
+                tight.lonEast + lonSpan * 0.2,
+                tight.latSouth - latSpan * 0.2,
+                tight.lonWest - lonSpan * 0.2
+            )
+            mapView.zoomToBoundingBox(padded, false, 80)
         } else if (allPts.size == 1) {
             mapView.controller.setZoom(15.0)
             mapView.controller.setCenter(allPts[0])
         }
         mapView.invalidate()
     }
-
     LaunchedEffect(trail, cutoffTs, loaded) {
         if (!loaded || trail.isEmpty()) return@LaunchedEffect
         val visible = trail.filter { it.ts <= cutoffTs }
-        val pts = visible.map { GeoPoint(it.lat, it.lon) }
         mapView.overlays.clear()
-        if (pts.isNotEmpty()) {
-            val casing = Polyline(mapView).apply {
-                paint.color = 0xE6000000.toInt()
-                paint.strokeWidth = 6f
+        if (visible.isNotEmpty()) {
+            // Replay semantics: only the flight currently being traversed is
+            // drawn. As the slider transitions from one flight to the next,
+            // the previous flight's path disappears.
+            val cur = visible.last()
+            val runs = ArrayList<List<TrailPointWithPilot>>()
+            var segStart = 0
+            for (i in 1..visible.size) {
+                if (i == visible.size || visible[i].ts - visible[i - 1].ts > FLIGHT_GAP_MS) {
+                    runs.add(visible.subList(segStart, i))
+                    segStart = i
+                }
             }
-            casing.setPoints(pts)
-            mapView.overlays.add(casing)
-            val core = Polyline(mapView).apply {
-                paint.color = 0xFFFFFFFF.toInt()
-                paint.strokeWidth = 4f
+            val currentRun = runs.last()
+            if (currentRun.size >= 2) {
+                val rp = currentRun.map { GeoPoint(it.lat, it.lon) }
+                val casing = Polyline(mapView).apply {
+                    paint.color = 0xE6000000.toInt()
+                    paint.strokeWidth = 6f
+                }
+                casing.setPoints(rp)
+                mapView.overlays.add(casing)
+                val core = Polyline(mapView).apply {
+                    paint.color = 0xFFFFFFFF.toInt()
+                    paint.strokeWidth = 4f
+                }
+                core.setPoints(rp)
+                mapView.overlays.add(core)
             }
-            core.setPoints(pts)
-            mapView.overlays.add(core)
+
             val m = Marker(mapView).apply {
                 setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                 setInfoWindow(null)
+                icon = IconCache.drone(context, cur.alt, false).toDrawable(context.resources)
             }
-            m.position = pts.last()
+            m.position = GeoPoint(cur.lat, cur.lon)
             mapView.overlays.add(m)
+
+            // Pilot indicator + connecting line to the drone, mirroring the
+            // live map: use the last fix's pilot position (pilot is usually
+            // stationary while the drone moves).
+            val pilotPt = visible.lastOrNull { isValidPosition(it.pilotLat, it.pilotLon) }
+            if (pilotPt != null) {
+                val line = Polyline(mapView).apply {
+                    paint.color = 0xCC00BCD4.toInt()
+                    paint.strokeWidth = 4f
+                }
+                line.setPoints(
+                    listOf(
+                        GeoPoint(cur.lat, cur.lon),
+                        GeoPoint(pilotPt.pilotLat, pilotPt.pilotLon)
+                    )
+                )
+                mapView.overlays.add(line)
+                val pm = Marker(mapView).apply {
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                    setInfoWindow(null)
+                    icon = IconCache.pilot(context, false).toDrawable(context.resources)
+                }
+                pm.position = GeoPoint(pilotPt.pilotLat, pilotPt.pilotLon)
+                mapView.overlays.add(pm)
+            }
         }
         drawScanBoxes()
         mapView.invalidate()
@@ -291,8 +362,7 @@ fun DroneFlightsScreen(vm: SkySpyViewModel, droneKey: String, onBack: () -> Unit
                         )
                     }
                     Text(
-                        "History: ${formatDurationMs((sliderMinutes * 60_000).toLong())} of " +
-                            "${formatDurationMs((maxMinutes * 60_000).toLong())}",
+                        "${FLIGHT_DATE.format(Date(cutoffTs))}",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -320,7 +390,7 @@ private fun formatDurationMs(ms: Long): String {
  * blowing up into the fixed ~2.2 km block the scanner uses for a single point.
  */
 private fun flightBounds(
-    trail: List<TrailPoint>,
+    trail: List<TrailPointWithPilot>,
     marginM: Double
 ): SatelliteAnalyzer.GeoBounds {
     var latMin = Double.MAX_VALUE

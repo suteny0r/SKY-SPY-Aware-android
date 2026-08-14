@@ -35,13 +35,18 @@ object DroneClassifier {
 
     /**
      * Classify from a position trail and the satellite scan for that drone.
+     * A user-supplied [note] (e.g. "coast guard") overrides/steers the role
+     * when it matches a known keyword; otherwise the evidence rules apply.
      * Returns the role plus a human-readable justification string.
      */
     fun classify(
         pts: List<StatPoint>,
-        satellite: Map<String, Int>
+        satellite: Map<String, Int>,
+        note: String = ""
     ): Pair<PilotRole, String> {
         if (pts.isEmpty()) return PilotRole.UNKNOWN to "no position history"
+
+        hintRole(note)?.let { return it }
 
         val (cLat, cLon) = meanCenter(pts)
         val bboxKm = bboxKm(pts, cLat, cLon)
@@ -68,6 +73,36 @@ object DroneClassifier {
                 "no distinctive pattern (${maritime} ship, ${recreation} rec, " +
                 "$industrial industrial objects)"
         }
+    }
+
+    /** A user note overrides/steers the role when it matches a keyword. */
+    private fun hintRole(note: String): Pair<PilotRole, String>? {
+        val n = note.lowercase().trim()
+        if (n.isEmpty()) return null
+        val hints = listOf(
+            PilotRole.PORT_INSPECTION to listOf(
+                "coast guard", "coastguard", "port", "harbor", "harbour",
+                "ship", "maritime", "navy", "marine", "customs", "border patrol", "cg"
+            ),
+            PilotRole.BEACH_TOURISM to listOf(
+                "beach", "tourist", "recreation", "resort", "vacation", "surf"
+            ),
+            PilotRole.SITE_MONITORING to listOf(
+                "construction", "site", "inspection", "industrial", "crane",
+                "survey", "monitoring", "surveillance"
+            ),
+            PilotRole.GENERAL to listOf(
+                "media", "news", "film", "delivery", "police", "fire", "rescue",
+                "search", "leo", "law enforcement", "government", "agriculture",
+                "farm", "utility", "real estate"
+            )
+        )
+        for ((role, words) in hints) {
+            for (w in words) {
+                if (w in n) return role to "note says \"$note\""
+            }
+        }
+        return null
     }
 
     /** Outlier-robust center (same filter as StatisticsCalculator). */

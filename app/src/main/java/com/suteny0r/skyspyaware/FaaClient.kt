@@ -52,7 +52,7 @@ object FaaClient {
                 code == 0 ->
                     FaaLookup("Lookup failed: no response", true)
                 else ->
-                    FaaLookup("No registration data", false)
+                    FaaLookup(FAA_NOT_FOUND, false)
             }
         } catch (e: SocketTimeoutException) {
             FaaLookup("Lookup failed: timeout", true)

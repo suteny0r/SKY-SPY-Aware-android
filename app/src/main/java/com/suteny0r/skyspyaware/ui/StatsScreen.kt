@@ -32,8 +32,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.suteny0r.skyspyaware.DroneCategory
 import com.suteny0r.skyspyaware.DroneStats
 import com.suteny0r.skyspyaware.LaunchType
+import com.suteny0r.skyspyaware.PilotProfile
 import com.suteny0r.skyspyaware.PilotRole
 import com.suteny0r.skyspyaware.SkySpyViewModel
 import com.suteny0r.skyspyaware.Statistics
@@ -164,12 +166,12 @@ fun StatsScreen(vm: SkySpyViewModel, onSelect: (String) -> Unit) {
 }
 
 @Composable
-private fun SectionTitle(text: String) {
+fun SectionTitle(text: String) {
     Text(text, style = MaterialTheme.typography.titleMedium)
 }
 
 @Composable
-private fun StatCell(value: String, label: String, modifier: Modifier = Modifier) {
+fun StatCell(value: String, label: String, modifier: Modifier = Modifier) {
     Column(
         modifier = modifier
             .background(
@@ -193,7 +195,7 @@ private fun StatCell(value: String, label: String, modifier: Modifier = Modifier
 }
 
 @Composable
-private fun BarChart(values: List<Int>, labels: List<String>) {
+fun BarChart(values: List<Int>, labels: List<String>) {
     if (values.isEmpty()) return
     val maxV = values.maxOrNull()?.coerceAtLeast(1) ?: 1
     val barColor = MaterialTheme.colorScheme.primary
@@ -227,7 +229,7 @@ private fun BarChart(values: List<Int>, labels: List<String>) {
 }
 
 @Composable
-private fun DroneRow(d: DroneStats, maxFlights: Int, onClick: () -> Unit) {
+fun DroneRow(d: DroneStats, maxFlights: Int, onClick: () -> Unit) {
     Column(
         Modifier
             .fillMaxWidth()
@@ -273,6 +275,40 @@ private fun DroneRow(d: DroneStats, maxFlights: Int, onClick: () -> Unit) {
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
+        if (d.make.isNotEmpty() || d.model.isNotEmpty()) {
+            Text(
+                "${if (d.make.isNotEmpty()) d.make else ""}" +
+                    "${if (d.make.isNotEmpty() && d.model.isNotEmpty()) " " else ""}" +
+                    "${d.model}".ifBlank { "unknown model" },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        val profiles = d.pilotProfile.filter { it != PilotProfile.UNKNOWN }
+        if (profiles.isNotEmpty()) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                profiles.forEach { p ->
+                    Box(
+                        Modifier
+                            .background(profileColor(p).copy(alpha = 0.16f), RoundedCornerShape(4.dp))
+                            .padding(horizontal = 5.dp, vertical = 1.dp)
+                    ) {
+                        Text(
+                            p.label,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = profileColor(p),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
         Text(
             "speed ${formatSpeed(d.minSpeedMs)}-${formatSpeed(d.maxSpeedMs)}  •  " +
                 "avg ${formatSpeed(d.avgSpeedMs)}  •  max alt ${d.maxAltitudeM} m",
@@ -334,18 +370,20 @@ private fun RoleRow(role: PilotRole, count: Int, max: Int) {
     }
 }
 
-private fun formatCount(n: Number): String = String.format(Locale.US, "%,d", n.toLong())
+fun formatCount(n: Number): String = String.format(Locale.US, "%,d", n.toLong())
 
-private fun formatDuration(ms: Long): String {
+fun formatCurrency(usd: Int): String = String.format(Locale.US, "$%,d", usd)
+
+fun formatDuration(ms: Long): String {
     val totalMin = ms / 60000
     val h = totalMin / 60
     val m = totalMin % 60
     return if (h > 0) "${h}h ${m}m" else "${m}m"
 }
 
-private fun formatDistance(m: Double): String =
+fun formatDistance(m: Double): String =
     if (m >= 1000) String.format(Locale.US, "%.1f km", m / 1000)
     else String.format(Locale.US, "%.0f m", m)
 
-private fun formatSpeed(ms: Double): String =
+fun formatSpeed(ms: Double): String =
     String.format(Locale.US, "%.1f mph", ms * 2.2369362920544)

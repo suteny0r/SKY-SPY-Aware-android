@@ -21,6 +21,28 @@ enum class LaunchType(val label: String) {
     UNKNOWN("launch unknown")
 }
 
+/** A single detected flight (a continuous segment of one drone's trail). */
+data class FlightSummary(
+    val droneKey: String,
+    val make: String,
+    val model: String,
+    val startTs: Long,
+    val endTs: Long,
+    val durationMs: Long,
+    val distanceM: Double,
+    val positions: Int,
+    val centroidLat: Double,
+    val centroidLon: Double
+)
+
+/**
+ * Segment the entire retained history into individual flights and return one
+ * [FlightSummary] per flight (across all drones), newest first. A flight is a
+ * continuous run of fixes separated from the next by more than [FLIGHT_GAP_MS].
+ * Simulator drones are excluded. Used by the Flights tab to surface repeat
+ * flyers (the same drone / same area, many times) for commercial/LEO spotting.
+ */
+
 /** Per-drone statistics summary. */
 data class DroneStats(
     val key: String,
@@ -37,7 +59,11 @@ data class DroneStats(
     val roleReason: String,
     val launch: LaunchType,
     val satellite: Map<String, Int>,
-    val isSimulator: Boolean
+    val isSimulator: Boolean,
+    val make: String = "",
+    val model: String = "",
+    val msrpUsd: Int = 0,
+    val pilotProfile: List<PilotProfile> = emptyList()
 )
 
 /** Aggregate statistics for the Stats tab. */
@@ -58,7 +84,19 @@ data class Statistics(
     val roleCounts: Map<PilotRole, Int>,
     val launchCounts: Map<LaunchType, Int>,
     val simulatorDrones: Int,
-    val simulatorDetections: Long
+    val simulatorDetections: Long,
+    /** make -> number of distinct drones of that make. */
+    val makeCounts: Map<String, Int>,
+    /** "make model" -> number of distinct drones of that model. */
+    val modelCounts: Map<String, Int>,
+    /** "make model" -> drone keys (basic_id/MAC) attributed to that model. */
+    val modelDrones: Map<String, List<String>>,
+    /** Pilot-profile -> number of distinct drones (MSRP-based estimate). */
+    val pilotProfileCounts: Map<PilotProfile, Int>,
+    /** Aircraft category -> number of distinct drones. */
+    val categoryCounts: Map<DroneCategory, Int>,
+    /** Sum of estimated MSRP across distinct drones (fleet value). */
+    val fleetValueUsd: Long
 )
 
 /**
@@ -77,10 +115,13 @@ object StatisticsCalculator {
     fun compute(
         rows: List<CachedDetection>,
         simulatorKeys: Set<String>,
-        satellite: Map<String, Map<String, Int>>
+        satellite: Map<String, Map<String, Int>>,
+        faaText: Map<String, String> = emptyMap(),
+        notes: Map<String, String> = emptyMap()
     ): Statistics {
         val byKey = LinkedHashMap<String, MutableList<StatPoint>>()
         val pilotByKey = HashMap<String, Pair<Double, Double>>()
+        val macByKey = HashMap<String, String>()
         val simSeen = HashSet<String>()
         var allRows = 0L
         var simDetections = 0L
@@ -95,6 +136,9 @@ object StatisticsCalculator {
                 simSeen.add(key)
                 continue
             }
+            // Remember a MAC for OUI-based make attribution (only when there
+            // is no basic_id to key on).
+            macByKey.putIfAbsent(key, r.mac)
             // Pilot positions are usually accurate; keep the latest one seen.
             if (isValidPosition(r.pilotLat, r.pilotLon)) {
                 pilotByKey[key] = r.pilotLat to r.pilotLon
@@ -110,6 +154,11 @@ object StatisticsCalculator {
         val droneStats = ArrayList<DroneStats>()
         val roleCounts = HashMap<PilotRole, Int>()
         val launchCounts = HashMap<LaunchType, Int>()
+        val makeCounts = HashMap<String, Int>()
+        val modelCounts = HashMap<String, Int>()
+        val pilotProfileCounts = HashMap<PilotProfile, Int>()
+        val categoryCounts = HashMap<DroneCategory, Int>()
+        var fleetValueUsd = 0L
         val cal = Calendar.getInstance()
 
         var totalFlightTimeMs = 0L
@@ -164,8 +213,24 @@ object StatisticsCalculator {
             }
             val avgAlt = altSumFor(pts)
             val sat = satellite[key] ?: emptyMap()
-            val (role, roleReason) = DroneClassifier.classify(pts, sat)
+            val (role, roleReason) = DroneClassifier.classify(pts, sat, notes[key] ?: "")
             val launch = launchFor(key, pts, pilotByKey, sat)
+            val mac = macByKey[key] ?: ""
+            // Key is the basic_id when one exists, otherwise the MAC itself.
+            val basicId = if (key.contains(':')) "" else key
+            val (make, model) = DroneIdentity.resolve(basicId, mac, faaText[basicId])
+            val spec = DroneCatalog.match(make, model)
+            val msrp = spec?.msrpUsd ?: 0
+            if (make.isNotEmpty()) makeCounts.merge(make, 1, Int::plus)
+            if (make.isNotEmpty() || model.isNotEmpty()) {
+                val mm = if (model.isNotEmpty()) "$make $model".trim() else make
+                if (mm.isNotEmpty()) modelCounts.merge(mm, 1, Int::plus)
+            }
+            if (spec != null) {
+                spec.pilotProfiles.forEach { pilotProfileCounts.merge(it, 1, Int::plus) }
+                spec.categories.forEach { categoryCounts.merge(it, 1, Int::plus) }
+                fleetValueUsd += msrp
+            }
 
             droneStats.add(
                 DroneStats(
@@ -183,7 +248,11 @@ object StatisticsCalculator {
                     roleReason = roleReason,
                     launch = launch,
                     satellite = sat,
-                    isSimulator = false
+                    isSimulator = false,
+                    make = make,
+                    model = model,
+                    msrpUsd = msrp,
+                    pilotProfile = if (spec != null) spec.pilotProfiles.toList() else listOf(PilotProfile.UNKNOWN)
                 )
             )
             roleCounts.merge(role, 1, Int::plus)
@@ -198,6 +267,14 @@ object StatisticsCalculator {
 
         droneStats.sortWith(compareByDescending<DroneStats> { it.flights }
             .thenByDescending { it.detections })
+        // Full model -> drone-key map (not limited like topDrones) so the
+        // "Drone models" tree can list every drone under its model.
+        val modelDrones = LinkedHashMap<String, MutableList<String>>()
+        for (d in droneStats) {
+            val mm = if (d.model.isNotEmpty()) "${d.make} ${d.model}".trim() else d.make
+            if (mm.isEmpty()) continue
+            modelDrones.getOrPut(mm) { mutableListOf() }.add(d.key)
+        }
         val topDrones = droneStats.take(12)
 
         return Statistics(
@@ -217,7 +294,13 @@ object StatisticsCalculator {
             roleCounts = roleCounts,
             launchCounts = launchCounts,
             simulatorDrones = simSeen.size,
-            simulatorDetections = simDetections
+            simulatorDetections = simDetections,
+            makeCounts = makeCounts,
+            modelCounts = modelCounts,
+            modelDrones = modelDrones,
+            pilotProfileCounts = pilotProfileCounts,
+            categoryCounts = categoryCounts,
+            fleetValueUsd = fleetValueUsd
         )
     }
 
@@ -288,5 +371,102 @@ object StatisticsCalculator {
             Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
             Math.sin(dLon / 2) * Math.sin(dLon / 2)
         return r * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+    }
+
+    /**
+     * Segment the entire retained history into individual flights (gap-based)
+     * and return one [FlightSummary] per flight, newest first. A flight is a
+     * continuous run of fixes separated from the next by more than
+     * [FLIGHT_GAP_MS]. Simulator drones are excluded. Used as a fallback when
+     * no persisted flight segments exist in the database.
+     */
+    fun computeFlights(
+        rows: List<CachedDetection>,
+        simulatorKeys: Set<String>,
+        faaText: Map<String, String> = emptyMap()
+    ): List<FlightSummary> {
+        val byKey = LinkedHashMap<String, MutableList<StatPoint>>()
+        val macByKey = HashMap<String, String>()
+        val basicIdByKey = HashMap<String, String>()
+        for (r in rows) {
+            if (!isValidPosition(r.droneLat, r.droneLon)) continue
+            val key = r.basicId.ifBlank { r.mac }
+            if (key in simulatorKeys) continue
+            byKey.getOrPut(key) { mutableListOf() }
+                .add(StatPoint(r.ts, r.droneLat, r.droneLon, r.droneAltitude))
+            macByKey.putIfAbsent(key, r.mac)
+            basicIdByKey.putIfAbsent(key, r.basicId)
+        }
+        val out = ArrayList<FlightSummary>()
+        for ((key, pts) in byKey) {
+            pts.sortBy { it.ts }
+            val basicId = basicIdByKey[key].orEmpty().ifBlank { if (key.contains(':')) "" else key }
+            val mac = macByKey[key] ?: key
+            val (make, model) = DroneIdentity.resolve(basicId, mac, faaText[basicId])
+            for (seg in groupFlights(pts)) {
+                var dist = 0.0
+                for (i in 1 until seg.size) {
+                    val d = haversine(seg[i - 1].lat, seg[i - 1].lon, seg[i].lat, seg[i].lon)
+                    if (d <= 0) continue
+                    dist += d
+                }
+                var latSum = 0.0
+                var lonSum = 0.0
+                for (p in seg) {
+                    latSum += p.lat
+                    lonSum += p.lon
+                }
+                out.add(
+                    FlightSummary(
+                        droneKey = key,
+                        make = make,
+                        model = model,
+                        startTs = seg.first().ts,
+                        endTs = seg.last().ts,
+                        durationMs = (seg.last().ts - seg.first().ts).coerceAtLeast(0),
+                        distanceM = dist,
+                        positions = seg.size,
+                        centroidLat = latSum / seg.size,
+                        centroidLon = lonSum / seg.size
+                    )
+                )
+            }
+        }
+        out.sortByDescending { it.startTs }
+        return out
+    }
+
+    /**
+     * Build flight summaries from persisted flight segments derived at import
+     * time from the log boundary markers (preferred over gap-based inference).
+     */
+    fun flightsFromDb(
+        records: List<FlightRecord>,
+        faaText: Map<String, String> = emptyMap(),
+        simulatorKeys: Set<String> = emptySet()
+    ): List<FlightSummary> {
+        val out = ArrayList<FlightSummary>()
+        for (rec in records) {
+            if (rec.key in simulatorKeys) continue
+            val key = rec.key
+            val basicId = if (key.contains(':')) "" else key
+            val (make, model) = DroneIdentity.resolve(basicId, "", faaText[basicId])
+            out.add(
+                FlightSummary(
+                    droneKey = key,
+                    make = make,
+                    model = model,
+                    startTs = rec.startTs,
+                    endTs = rec.endTs,
+                    durationMs = (rec.endTs - rec.startTs).coerceAtLeast(0),
+                    distanceM = rec.distanceM,
+                    positions = rec.nPoints,
+                    centroidLat = (rec.startLat + rec.endLat) / 2.0,
+                    centroidLon = (rec.startLon + rec.endLon) / 2.0
+                )
+            )
+        }
+        out.sortByDescending { it.startTs }
+        return out
     }
 }
