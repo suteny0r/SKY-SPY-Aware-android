@@ -55,7 +55,8 @@ object DroneCatalog {
         // --- DJI consumer / prosumer ---
         DroneModelSpec("DJI Mini 2", 449, DroneCategory.PROSUMER, listOf("mini 2")),
         DroneModelSpec("DJI Mini 3", 559, DroneCategory.PROSUMER, listOf("mini 3")),
-        DroneModelSpec("DJI Mini 4 Pro", 999, DroneCategory.PROSUMER, listOf("mini 4 pro", "mini 4k")),
+        DroneModelSpec("DJI Mini 4 Pro", 999, DroneCategory.PROSUMER, listOf("mini 4 pro")),
+        DroneModelSpec("DJI Mini 4K", 299, DroneCategory.TOY, listOf("mini 4k")),
         DroneModelSpec("DJI Mini 5 Pro", 1129, DroneCategory.PROSUMER, listOf("mini 5 pro")),
         DroneModelSpec("DJI Air 2S", 999, DroneCategory.PROSUMER, listOf("air 2s")),
         DroneModelSpec("DJI Air 3", 1099, DroneCategory.PROSUMER, listOf("air 3")),
@@ -96,11 +97,14 @@ object DroneCatalog {
         DroneModelSpec("Parrot Anafi", 699, DroneCategory.PROSUMER, listOf("anafi")),
         DroneModelSpec("Parrot Bluegrass", 4999, DroneCategory.INDUSTRIAL, listOf("bluegrass")),
         // --- Public-safety / law-enforcement (non-DJI) ---
-        DroneModelSpec("Teal 2", 4500, DroneCategory.PUBLIC_SAFETY, listOf("teal 2", "teal"), extraCategories = listOf(DroneCategory.INDUSTRIAL)),
+        // NOTE: keys must contain a model token, never a bare brand name — a
+        // make-only FCC record ("Make: Teal Drones", no Model line) must not
+        // invent an MSRP/category (see match() contract).
+        DroneModelSpec("Teal 2", 4500, DroneCategory.PUBLIC_SAFETY, listOf("teal 2"), extraCategories = listOf(DroneCategory.INDUSTRIAL)),
         DroneModelSpec("Brinc Lemur", 9700, DroneCategory.PUBLIC_SAFETY, listOf("brinc lemur", "lemur")),
         DroneModelSpec("Parrot ANAFI USA", 7000, DroneCategory.PUBLIC_SAFETY, listOf("anafi usa")),
-        DroneModelSpec("Draganfly Commander", 18000, DroneCategory.PUBLIC_SAFETY, listOf("draganfly"), extraCategories = listOf(DroneCategory.INDUSTRIAL)),
-        DroneModelSpec("WingtraOne", 20000, DroneCategory.INDUSTRIAL, listOf("wingtra"), extraCategories = listOf(DroneCategory.PUBLIC_SAFETY))
+        DroneModelSpec("Draganfly Commander", 18000, DroneCategory.PUBLIC_SAFETY, listOf("draganfly commander", "commander"), extraCategories = listOf(DroneCategory.INDUSTRIAL)),
+        DroneModelSpec("WingtraOne", 20000, DroneCategory.INDUSTRIAL, listOf("wingtraone"), extraCategories = listOf(DroneCategory.PUBLIC_SAFETY))
     )
 
     private val index: List<Pair<String, DroneModelSpec>> =
@@ -135,6 +139,20 @@ object DroneCatalog {
             }
         }
         return best
+    }
+
+    /**
+     * Canonical display/grouping label for a make+model pair: strips the
+     * parenthetical serial suffixes FCC registrations append to model names
+     * ("Mavic Air 2 (MA2UE3W)") and collapses whitespace, preserving case.
+     * Grouping by the raw strings splits one model into per-suffix rows.
+     */
+    fun canonicalLabel(make: String, model: String): String {
+        val m = model
+            .replace(Regex("\\s*\\([^)]*\\)"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return if (m.isNotEmpty()) "$make $m".trim() else make.trim()
     }
 
     /** MSRP for a display label of the form "Make Model" (e.g. from modelCounts). */

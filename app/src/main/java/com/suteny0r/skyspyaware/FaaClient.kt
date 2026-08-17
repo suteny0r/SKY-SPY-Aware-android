@@ -35,15 +35,27 @@ object FaaClient {
     private const val UA =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0"
 
+    // One process-wide cookie store, installed once. Re-installing a fresh
+    // CookieManager on every lookup (every 5s during the crawl) would reset
+    // the global store shared by all HttpURLConnection users, including
+    // osmdroid tile fetches.
+    private val cookieManager = CookieManager()
+
+    private fun installCookieManager() {
+        if (CookieHandler.getDefault() !== cookieManager) {
+            CookieHandler.setDefault(cookieManager)
+        }
+    }
+
     fun lookup(basicId: String): FaaLookup {
         return try {
-            CookieHandler.setDefault(CookieManager())
+            installCookieManager()
             session()
             val (code, body) = query(basicId)
             when {
                 code in 200..299 && body.isNotBlank() -> {
                     val s = summarize(body)
-                    FaaLookup(s.text, false, s.make, s.model)
+                    FaaLookup(s.text, s.retriable, s.make, s.model)
                 }
                 code == 429 ->
                     FaaLookup("Lookup failed: rate limited (429)", true)
@@ -51,8 +63,16 @@ object FaaClient {
                     FaaLookup("Lookup failed: server error ($code)", true)
                 code == 0 ->
                     FaaLookup("Lookup failed: no response", true)
+                code in 200..299 ->
+                    FaaLookup("Lookup failed: empty response", true)
                 else ->
-                    FaaLookup(FAA_NOT_FOUND, false)
+                    // 3xx (captive portal), 401/403 (WAF), 404 on the API
+                    // path, etc. are NOT proof the serial is unregistered.
+                    // The only definitive not-found is a 2xx whose items
+                    // array is empty (see summarize). Everything else must
+                    // stay retriable or a captive portal marks the whole
+                    // fleet as simulators forever.
+                    FaaLookup("Lookup failed: HTTP $code", true)
             }
         } catch (e: SocketTimeoutException) {
             FaaLookup("Lookup failed: timeout", true)
@@ -106,7 +126,7 @@ object FaaClient {
     }
 
     private fun summarize(json: String): FaaSummary {
-        if (json.isBlank()) return FaaSummary("No registration data", "", "")
+        if (json.isBlank()) return FaaSummary("No registration data", "", "", retriable = true)
         return try {
             val items = JSONObject(json)
                 .optJSONObject("data")?.optJSONArray("items")
@@ -139,9 +159,17 @@ object FaaClient {
                 FaaSummary(sb.toString(), make, model)
             }
         } catch (e: Exception) {
-            FaaSummary("Registered (parse error)", "", "")
+            // A 2xx with an unparseable body (WAF interstitial, HTML error
+            // page) proves nothing about the registration; retry later
+            // instead of caching this text forever.
+            FaaSummary("Registered (parse error)", "", "", retriable = true)
         }
     }
 
-    private data class FaaSummary(val text: String, val make: String, val model: String)
+    private data class FaaSummary(
+        val text: String,
+        val make: String,
+        val model: String,
+        val retriable: Boolean = false
+    )
 }

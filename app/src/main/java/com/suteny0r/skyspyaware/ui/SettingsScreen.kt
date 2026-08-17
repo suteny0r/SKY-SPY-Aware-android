@@ -106,9 +106,17 @@ fun SettingsScreen(vm: SkySpyViewModel) {
             label = { Text("Broker host") },
             modifier = Modifier.fillMaxWidth()
         )
+        // The field edits a text buffer, not settings.port directly: parsing
+        // every keystroke with an `?: 8883` fallback made the field snap back
+        // to 8883 the moment it was cleared, so a new port could never be
+        // typed from empty.
+        var portText by remember { mutableStateOf(settings.port.toString()) }
         OutlinedTextField(
-            value = settings.port.toString(),
-            onValueChange = { settings = settings.copy(port = it.toIntOrNull() ?: 8883) },
+            value = portText,
+            onValueChange = { raw ->
+                portText = raw.filter { it.isDigit() }.take(5)
+                portText.toIntOrNull()?.let { p -> settings = settings.copy(port = p) }
+            },
             label = { Text("Port") },
             modifier = Modifier.fillMaxWidth()
         )

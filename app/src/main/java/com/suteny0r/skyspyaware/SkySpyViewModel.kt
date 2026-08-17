@@ -33,6 +33,7 @@ class SkySpyViewModel(app: Application) : AndroidViewModel(app) {
     val historyStats: StateFlow<HistoryStats> = DataRepo.historyStats
     val stats: StateFlow<Statistics?> = DataRepo.stats
     val flights: StateFlow<List<FlightSummary>> = DataRepo.flights
+    val flightsLoaded: StateFlow<Boolean> = DataRepo.flightsLoaded
     val droneNotes: StateFlow<Map<String, String>> = DataRepo.droneNotes
     val noteSuggestions: StateFlow<List<String>> = DataRepo.noteSuggestions
 

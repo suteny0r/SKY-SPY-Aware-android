@@ -23,7 +23,23 @@ object LocationController {
     private val _location = MutableStateFlow<GeoPoint?>(null)
     val location: StateFlow<GeoPoint?> = _location
 
-    private var pendingCallback: ((GeoPoint?) -> Unit)? = null
+    private const val REQUEST_TIMEOUT_MS = 30_000L
+
+    // All callers waiting on the in-flight single-update request. A single
+    // slot would drop the first caller's callback when a second refresh
+    // arrives before the fix does.
+    private val pendingCallbacks = ArrayList<(GeoPoint?) -> Unit>()
+    private var requestInFlight = false
+
+    private fun flushCallbacks(p: GeoPoint?) {
+        val cbs = synchronized(pendingCallbacks) {
+            requestInFlight = false
+            val copy = pendingCallbacks.toList()
+            pendingCallbacks.clear()
+            copy
+        }
+        cbs.forEach { it(p) }
+    }
 
     /** Any last known position from any provider, regardless of age, or null. */
     fun lastKnown(context: Context): GeoPoint? {
@@ -57,7 +73,14 @@ object LocationController {
         }
 
         // Otherwise request a fresh fix and report it when it arrives.
-        pendingCallback = onResult
+        val alreadyInFlight = synchronized(pendingCallbacks) {
+            if (onResult != null) pendingCallbacks.add(onResult)
+            val was = requestInFlight
+            requestInFlight = true
+            was
+        }
+        if (alreadyInFlight) return
+
         var requested = false
         for (provider in providers) {
             try {
@@ -66,9 +89,7 @@ object LocationController {
                     object : LocationListener {
                         override fun onLocationChanged(location: Location) {
                             _location.value = GeoPoint(location.latitude, location.longitude)
-                            val cb = pendingCallback
-                            pendingCallback = null
-                            cb?.invoke(_location.value)
+                            flushCallbacks(_location.value)
                         }
 
                         @Deprecated("Deprecated in Java")
@@ -89,8 +110,14 @@ object LocationController {
             }
         }
         if (!requested) {
-            pendingCallback = null
-            onResult?.invoke(_location.value)
+            flushCallbacks(_location.value)
+            return
         }
+        // If no fix ever arrives, release the waiters with whatever we have
+        // instead of leaving them (and the provider request) pending forever.
+        android.os.Handler(Looper.getMainLooper()).postDelayed({
+            val stillWaiting = synchronized(pendingCallbacks) { requestInFlight }
+            if (stillWaiting) flushCallbacks(_location.value)
+        }, REQUEST_TIMEOUT_MS)
     }
 }

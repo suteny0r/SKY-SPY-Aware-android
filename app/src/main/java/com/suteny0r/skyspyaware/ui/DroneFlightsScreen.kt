@@ -334,17 +334,26 @@ fun DroneFlightsScreen(
                             if (!scanning && trail.isNotEmpty()) {
                                 scanning = true
                                 scope.launch {
-                                    val tight = flightBounds(trail, marginM = 150.0)
-                                    val wide = flightBounds(trail, marginM = 700.0)
-                                    val scan =
-                                        SatelliteAnalyzer.scanCombined(context, wide, tight)
-                                    scanCounts = scan.counts
-                                    scanBoxes = scan.boxes
-                                    // Fresh object counts feed the role
-                                    // heuristic; recompute statistics so the
-                                    // drone's role assessment is recalculated.
-                                    vm.applySatelliteScan(droneKey, scan.counts)
-                                    scanning = false
+                                    // try/finally: an exception (bitmap OOM is
+                                    // a documented reality here) must not
+                                    // crash the UI scope or leave the button
+                                    // stuck on "Scanning area..." forever.
+                                    try {
+                                        val tight = flightBounds(trail, marginM = 150.0)
+                                        val wide = flightBounds(trail, marginM = 700.0)
+                                        val scan =
+                                            SatelliteAnalyzer.scanCombined(context, wide, tight)
+                                        scanCounts = scan.counts
+                                        scanBoxes = scan.boxes
+                                        // Fresh object counts feed the role
+                                        // heuristic; recompute statistics so the
+                                        // drone's role assessment is recalculated.
+                                        vm.applySatelliteScan(droneKey, scan.counts)
+                                    } catch (_: Exception) {
+                                    } catch (_: OutOfMemoryError) {
+                                    } finally {
+                                        scanning = false
+                                    }
                                 }
                             }
                         },

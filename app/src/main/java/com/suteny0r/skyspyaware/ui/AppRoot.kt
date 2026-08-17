@@ -37,9 +37,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
-import com.suteny0r.skyspyaware.FAA_NOT_FOUND
+import com.suteny0r.skyspyaware.DataRepo
 import com.suteny0r.skyspyaware.FlightSummary
 import com.suteny0r.skyspyaware.SkySpyViewModel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
@@ -71,9 +72,12 @@ fun AppRoot(vm: SkySpyViewModel) {
     val selectedDrone = drones.firstOrNull { it.key == selectedKey }
 
     // Drone keys whose basicId failed the FAA registration lookup: treated as
-    // simulator/test drones.
+    // simulator/test drones. Uses the same test as the stats exclusion
+    // (DataRepo.isSimulator), which also accepts legacy cached sentinel texts;
+    // a strict FAA_NOT_FOUND equality here made the SIM badge disagree with
+    // the "excluded from statistics" set for pre-fix cache rows.
     val simulatorKeys = remember(faa) {
-        faa.filterValues { it == FAA_NOT_FOUND }.keys.toSet()
+        faa.filterValues { DataRepo.isSimulator(it) }.keys.toSet()
     }
 
     // Drone keys on a public-safety-style platform (heuristic from make/model).
@@ -88,14 +92,30 @@ fun AppRoot(vm: SkySpyViewModel) {
     // their trails to that window. 0 = live only (~1 min). Values up to 1 week
     // show [now - value, now]; past 1 week the slider positions a fixed 1-week
     // window that slides continuously back in time instead of ever-longer spans.
-    val nowMs = System.currentTimeMillis()
+    // Re-evaluate the window over time: with a quiet feed nothing else
+    // invalidates it, so a "live only" (60s) view would keep showing a drone
+    // last seen an hour ago.
+    var nowTick by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(5_000)
+            nowTick = System.currentTimeMillis()
+        }
+    }
+    val nowMs = nowTick
     val weekMs = 7L * 24 * 60 * 60 * 1000
     val windowStartMs = if (historyMinutes <= 0) nowMs - 60_000L
     else nowMs - historyMinutes * 60_000L
     val windowEndMs = minOf(nowMs, windowStartMs + weekMs)
-    val visibleDrones = remember(drones, historyMinutes, historyScale) {
+    val visibleDrones = remember(drones, historyMinutes, historyScale, nowTick) {
         drones
-            .filter { it.lastSeen >= windowStartMs && it.lastSeen <= windowEndMs }
+            // A drone belongs to the window if it was seen inside it OR has
+            // trail points inside it: a daily flyer must still appear in a
+            // past week's window even though its lastSeen is newer.
+            .filter { d ->
+                (d.lastSeen in windowStartMs..windowEndMs) ||
+                    d.trail.any { p -> p.ts in windowStartMs..windowEndMs }
+            }
             .map {
                 it.copy(trail = it.trail.filter { p -> p.ts >= windowStartMs && p.ts <= windowEndMs })
             }
@@ -116,6 +136,10 @@ fun AppRoot(vm: SkySpyViewModel) {
     val pendingSelection by vm.pendingSelection.collectAsState()
     LaunchedEffect(pendingSelection) {
         pendingSelection?.let { key ->
+            // A flight-replay screen replaces the whole tab UI; close it or
+            // the selection is consumed with no visible response.
+            selectedFlight = null
+            flightMapKey = null
             select(key, openMap = true)
             vm.consumePendingSelection()
         }
@@ -205,6 +229,7 @@ fun AppRoot(vm: SkySpyViewModel) {
                     onDroneSelected = { key -> select(key) },
                     focusKey = focusKey,
                     focusTick = focusTick,
+                    onFocusConsumed = { focusKey = null },
                     historyMinutes = historyMinutes,
                     onHistoryChange = { vm.setHistoryMinutes(it) },
                     historyMaxMinutes = historyMaxMinutes,
@@ -234,22 +259,34 @@ fun AppRoot(vm: SkySpyViewModel) {
                                 }
                                 val pagerState =
                                     rememberPagerState(initialPage = listIndex) { list.size }
-                                // Follow external selections (e.g. a new-drone
-                                // notification while browsing).
-                                LaunchedEffect(selectedKey) {
+                                // The pager is positional over a live-filtered
+                                // list, so re-sync it whenever EITHER the
+                                // selection or the list membership changes; on
+                                // churn (a drone aging out shifts the indices)
+                                // the page under the finger would otherwise
+                                // silently become a different drone.
+                                LaunchedEffect(selectedKey, list) {
                                     val i = list.indexOfFirst { it.key == selectedKey }
                                     if (i >= 0 && i != pagerState.settledPage) {
                                         pagerState.scrollToPage(i)
                                     }
                                 }
-                                // Swiping up/down moves through the list.
+                                // Swiping up/down moves through the list. Only
+                                // adopt the settled page while the selected
+                                // drone is still in the list: when it just left
+                                // the window this fires from index shift, and
+                                // adopting would rewrite the selection to an
+                                // arbitrary neighbor.
                                 LaunchedEffect(pagerState.settledPage) {
-                                    list.getOrNull(pagerState.settledPage)?.let {
-                                        selectedKey = it.key
+                                    if (list.any { it.key == selectedKey }) {
+                                        list.getOrNull(pagerState.settledPage)?.let {
+                                            selectedKey = it.key
+                                        }
                                     }
                                 }
                                 VerticalPager(
                                     state = pagerState,
+                                    key = { list[it].key },
                                     modifier = Modifier.fillMaxSize()
                                 ) { page ->
                                     val dk = list[page].basicId.ifBlank { list[page].mac }

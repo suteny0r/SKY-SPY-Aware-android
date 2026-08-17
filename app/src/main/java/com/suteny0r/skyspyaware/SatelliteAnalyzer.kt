@@ -42,7 +42,13 @@ object SatelliteAnalyzer {
 
     data class AreaScan(
         val counts: Map<String, Int>,
-        val boxes: List<ScanBox> = emptyList()
+        val boxes: List<ScanBox> = emptyList(),
+        /**
+         * False when any imagery tile failed to download. An incomplete scan
+         * ran the detector over partially black imagery: its counts must not
+         * be cached as a definitive 24h result.
+         */
+        val complete: Boolean = true
     )
 
     /** Geographic rectangle (lat/lon) of an area of interest. */
@@ -132,7 +138,7 @@ object SatelliteAnalyzer {
         val boxes = mergeBoxes(wide.boxes, tight.boxes)
         val counts = HashMap<String, Int>()
         for (b in boxes) counts.merge(b.label, 1, Int::plus)
-        return AreaScan(counts, boxes)
+        return AreaScan(counts, boxes, complete = wide.complete && tight.complete)
     }
 
     /** Dedup two box lists by class-aware geo overlap (IoU), keeping the
@@ -179,7 +185,9 @@ object SatelliteAnalyzer {
         zoom: Int
     ): AreaScan = withContext(Dispatchers.IO) {
         YoloDetector.init(context)
-        val bmp = fetchGrid(lat, lon, zoom) ?: return@withContext AreaScan(emptyMap())
+        val grid = fetchGrid(lat, lon, zoom)
+            ?: return@withContext AreaScan(emptyMap(), complete = false)
+        val bmp = grid.bitmap
         val dets = YoloDetector.detect(bmp)
         val boxes = ArrayList<ScanBox>(dets.size)
         val gridW = bmp.width
@@ -210,14 +218,17 @@ object SatelliteAnalyzer {
         bmp.recycle()
         val counts = HashMap<String, Int>()
         for (d in dets) counts.merge(d.className, 1, Int::plus)
-        AreaScan(counts, boxes)
+        AreaScan(counts, boxes, complete = grid.complete)
     }
 
-    private fun fetchGrid(lat: Double, lon: Double, zoom: Int): Bitmap? {
+    private class GridResult(val bitmap: Bitmap, val complete: Boolean)
+
+    private fun fetchGrid(lat: Double, lon: Double, zoom: Int): GridResult? {
         val (cx, cy) = tileXY(lat, lon, zoom)
         val out = Bitmap.createBitmap(GRID * TILE, GRID * TILE, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
         val half = GRID / 2
+        var failed = 0
         for (gy in 0 until GRID) {
             for (gx in 0 until GRID) {
                 val tx = cx - half + gx
@@ -230,10 +241,18 @@ object SatelliteAnalyzer {
                 if (bmp != null) {
                     canvas.drawBitmap(bmp, (gx * TILE).toFloat(), (gy * TILE).toFloat(), null)
                     bmp.recycle()
+                } else {
+                    failed++
                 }
             }
         }
-        return out
+        if (failed == GRID * GRID) {
+            // No imagery at all (offline): running the detector over a fully
+            // black bitmap yields garbage. Report failure instead.
+            out.recycle()
+            return null
+        }
+        return GridResult(out, complete = failed == 0)
     }
 
     /**
@@ -275,13 +294,16 @@ object SatelliteAnalyzer {
     ): Pair<Double, Double> {
         val (cx, cy) = tileXY(centerLat, centerLon, zoom)
         val half = GRID / 2
-        val gx = (px / TILE).toInt().coerceIn(0, GRID - 1)
-        val gy = (py / TILE).toInt().coerceIn(0, GRID - 1)
-        val subX = (px % TILE).coerceAtLeast(0f)
-        val subY = (py % TILE).coerceAtLeast(0f)
+        // Rotated boxes near the grid edge legitimately produce corners just
+        // outside [0, GRID*TILE]. Clamp the pixel, then map straight to world
+        // pixels; the old per-tile modulo wrapped an out-of-range corner by a
+        // full tile (~600 m at z16), grossly distorting the polygon.
+        val maxPx = (GRID * TILE).toFloat()
+        val cpx = px.coerceIn(0f, maxPx)
+        val cpy = py.coerceIn(0f, maxPx)
         val n = 1 shl zoom
-        val worldX = (cx - half + gx) * TILE + subX
-        val worldY = (cy - half + gy) * TILE + subY
+        val worldX = (cx - half).toDouble() * TILE + cpx
+        val worldY = (cy - half).toDouble() * TILE + cpy
         val lon = worldX / (n * TILE) * 360.0 - 180.0
         val latRad = Math.atan(Math.sinh(Math.PI * (1.0 - 2.0 * worldY / (n * TILE))))
         return Math.toDegrees(latRad) to lon

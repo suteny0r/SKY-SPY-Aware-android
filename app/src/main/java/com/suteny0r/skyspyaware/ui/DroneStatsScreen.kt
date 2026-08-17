@@ -106,9 +106,12 @@ fun DroneStatsScreen(
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             StatCell("Est. fleet value", formatCurrency(s.fleetValueUsd.toInt()), Modifier.weight(1f))
+            // identifiedCount counts each drone once; summing the per-profile
+            // chart would double-count dual-badged (industrial+public-safety)
+            // aircraft.
             StatCell(
                 "Identified",
-                "${s.pilotProfileCounts.values.sum()}",
+                "${s.identifiedCount}",
                 Modifier.weight(1f)
             )
         }

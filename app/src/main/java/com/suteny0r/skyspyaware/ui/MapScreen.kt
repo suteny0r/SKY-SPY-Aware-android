@@ -297,6 +297,7 @@ fun MapScreen(
     onDroneSelected: (String) -> Unit,
     focusKey: String?,
     focusTick: Int,
+    onFocusConsumed: () -> Unit = {},
     historyMinutes: Int,
     onHistoryChange: (Int) -> Unit,
     historyMaxMinutes: Int,
@@ -334,6 +335,20 @@ fun MapScreen(
     var userMoved by remember { mutableStateOf(false) }
     var zoomLevel by remember { mutableStateOf(mapView.zoomLevelDouble) }
 
+    // osmdroid dispatches onScroll/onZoom for PROGRAMMATIC setCenter/setZoom
+    // too, so without suppression the very first auto-center trips the
+    // userMoved guard and permanently disables startup centering and
+    // my-location follow.
+    val programmaticMove = remember { mutableStateOf(false) }
+    fun moveCamera(block: () -> Unit) {
+        programmaticMove.value = true
+        try {
+            block()
+        } finally {
+            programmaticMove.value = false
+        }
+    }
+
     // On-demand classification of the current map viewport via on-device
     // YOLO. When enabled we snapshot the rendered map, run detection off the
     // main thread, and draw classic bounding boxes + labels scaled to the
@@ -355,17 +370,27 @@ fun MapScreen(
             val h = mapView.height
             if (w <= 0 || h <= 0) return@launch
             classifyBusy = true
-            // Snapshot the current rendered map (tiles + markers) on the
-            // main thread, then run inference off it.
-            val shot = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-            mapView.draw(Canvas(shot))
-            val dets = withContext(Dispatchers.Default) {
-                YoloDetector.detect(shot)
+            try {
+                // Snapshot the current rendered map (tiles + markers) on the
+                // main thread, then run inference off it. The ~9MB snapshot
+                // is recycled right after inference (also on cancellation)
+                // so pan-driven reruns don't accumulate bitmaps until GC.
+                val shot = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                mapView.draw(Canvas(shot))
+                val dets = withContext(Dispatchers.Default) {
+                    try {
+                        YoloDetector.detect(shot)
+                    } finally {
+                        shot.recycle()
+                    }
+                }
+                classifyDets.value = dets
+                classifyCaptureSize.value = Size(w.toFloat(), h.toFloat())
+            } catch (_: OutOfMemoryError) {
+                classifyDets.value = emptyList()
+            } finally {
+                classifyBusy = false
             }
-            classifyDets.value = dets
-            classifyCaptureSize.value = Size(w.toFloat(), h.toFloat())
-            classifyBusy = false
-            shot.recycle()
         }
     }
 
@@ -399,8 +424,10 @@ fun MapScreen(
     // Restore the saved camera once on attach.
     LaunchedEffect(Unit) {
         if (savedCamera != null) {
-            mapView.controller.setZoom(savedCamera.zoom)
-            mapView.controller.setCenter(GeoPoint(savedCamera.lat, savedCamera.lon))
+            moveCamera {
+                mapView.controller.setZoom(savedCamera.zoom)
+                mapView.controller.setCenter(GeoPoint(savedCamera.lat, savedCamera.lon))
+            }
             zoomLevel = savedCamera.zoom
         }
     }
@@ -415,15 +442,19 @@ fun MapScreen(
         if (savedCamera == null && focusKey == null) {
             val lastDrone = allDrones.maxByOrNull { it.lastSeen }
             if (lastDrone != null && isValidPosition(lastDrone.droneLat, lastDrone.droneLon)) {
-                mapView.controller.setCenter(GeoPoint(lastDrone.droneLat, lastDrone.droneLon))
-                mapView.controller.setZoom(INITIAL_ZOOM)
+                moveCamera {
+                    mapView.controller.setCenter(GeoPoint(lastDrone.droneLat, lastDrone.droneLon))
+                    mapView.controller.setZoom(INITIAL_ZOOM)
+                }
                 zoomLevel = INITIAL_ZOOM
                 centeredOnLocation = true
             } else {
                 LocationController.lastKnown(context)?.let { loc ->
                     if (!centeredOnLocation) {
-                        mapView.controller.setCenter(loc)
-                        mapView.controller.setZoom(INITIAL_ZOOM)
+                        moveCamera {
+                            mapView.controller.setCenter(loc)
+                            mapView.controller.setZoom(INITIAL_ZOOM)
+                        }
                         zoomLevel = INITIAL_ZOOM
                         centeredOnLocation = true
                     }
@@ -437,8 +468,10 @@ fun MapScreen(
             savedCamera == null && focusKey == null &&
             allDrones.none { isValidPosition(it.droneLat, it.droneLon) }
         ) {
-            mapView.controller.setCenter(myLocation!!)
-            mapView.controller.setZoom(INITIAL_ZOOM)
+            moveCamera {
+                mapView.controller.setCenter(myLocation!!)
+                mapView.controller.setZoom(INITIAL_ZOOM)
+            }
             zoomLevel = INITIAL_ZOOM
             centeredOnLocation = true
         }
@@ -453,8 +486,10 @@ fun MapScreen(
         ) {
             val lastDrone = allDrones.maxByOrNull { it.lastSeen }
             if (lastDrone != null && isValidPosition(lastDrone.droneLat, lastDrone.droneLon)) {
-                mapView.controller.setCenter(GeoPoint(lastDrone.droneLat, lastDrone.droneLon))
-                mapView.controller.setZoom(INITIAL_ZOOM)
+                moveCamera {
+                    mapView.controller.setCenter(GeoPoint(lastDrone.droneLat, lastDrone.droneLon))
+                    mapView.controller.setZoom(INITIAL_ZOOM)
+                }
                 zoomLevel = INITIAL_ZOOM
                 centeredOnLocation = true
             }
@@ -472,9 +507,23 @@ fun MapScreen(
     LaunchedEffect(focusTick, allDrones) {
         if (focusKey == null || lastCenteredTick == focusTick) return@LaunchedEffect
         allDrones.firstOrNull { it.key == focusKey }?.let {
-            mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
+            // A drone that never had a valid fix keeps (0,0); centering there
+            // pans the map to null island.
+            if (!isValidPosition(it.droneLat, it.droneLon)) {
+                lastCenteredTick = focusTick
+                onFocusConsumed()
+                return@LaunchedEffect
+            }
+            moveCamera {
+                mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
+            }
             userMoved = true
             lastCenteredTick = focusTick
+            saveCamera()
+            // Tell the owner the request was honored; without this the
+            // remember-scoped tick guard resets on every tab revisit and the
+            // camera snaps back to this drone forever.
+            onFocusConsumed()
         }
     }
 
@@ -482,6 +531,7 @@ fun MapScreen(
     DisposableEffect(Unit) {
         mapView.addMapListener(object : MapListener {
             override fun onScroll(event: ScrollEvent): Boolean {
+                if (programmaticMove.value) return false
                 userMoved = true
                 saveCamera()
                 rerunClassify()
@@ -489,6 +539,7 @@ fun MapScreen(
             }
 
             override fun onZoom(event: ZoomEvent): Boolean {
+                if (programmaticMove.value) return false
                 userMoved = true
                 saveCamera()
                 // A zoom change invalidates any snapshot the boxes were drawn
@@ -759,11 +810,14 @@ fun MapScreen(
         // the full retained set (allDrones), not just the history window.
         SmallFloatingActionButton(
             onClick = {
-                allDrones.maxByOrNull { it.lastSeen }?.let {
-                    mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
-                    userMoved = true
-                    saveCamera()
-                }
+                // Most recent drone WITH a known position; a position-less
+                // one keeps (0,0) and would pan the map to null island.
+                allDrones.filter { isValidPosition(it.droneLat, it.droneLon) }
+                    .maxByOrNull { it.lastSeen }?.let {
+                        mapView.controller.setCenter(GeoPoint(it.droneLat, it.droneLon))
+                        userMoved = true
+                        saveCamera()
+                    }
             },
             modifier = Modifier
                 .align(Alignment.TopEnd)

@@ -67,7 +67,7 @@ object DataRepo {
      * legacy "No registration data" text are accepted so already-cached lookups
      * are honoured.
      */
-    private fun isSimulator(result: String?): Boolean {
+    fun isSimulator(result: String?): Boolean {
         if (result == null) return false
         if (result == FAA_NOT_FOUND) return true
         val r = result.lowercase()
@@ -139,6 +139,11 @@ object DataRepo {
     private val _flights = MutableStateFlow<List<FlightSummary>>(emptyList())
     val flights: StateFlow<List<FlightSummary>> = _flights.asStateFlow()
 
+    // False until the first flight computation completes, so the Flights tab
+    // can distinguish "still computing" from "genuinely no flights".
+    private val _flightsLoaded = MutableStateFlow(false)
+    val flightsLoaded: StateFlow<Boolean> = _flightsLoaded.asStateFlow()
+
     private val _droneNotes = MutableStateFlow<Map<String, String>>(emptyMap())
     val droneNotes: StateFlow<Map<String, String>> = _droneNotes.asStateFlow()
 
@@ -175,6 +180,28 @@ object DataRepo {
     private val flightClassifiedTs = HashMap<String, Long>()
 
     private var lastPruneMs = 0L
+
+    // Stable notification ids per drone key. key.hashCode() can collide,
+    // which would both replace the wrong notification and (via
+    // FLAG_UPDATE_CURRENT on a colliding requestCode) rewrite the surviving
+    // PendingIntent's extra to the newer key.
+    private val notifIds = HashMap<String, Int>()
+    private var nextNotifId = 1000
+    private fun notifIdFor(key: String): Int =
+        synchronized(notifIds) { notifIds.getOrPut(key) { nextNotifId++ } }
+
+    /** Publish a consistent snapshot of the drone map to the UI. */
+    private fun publishDrones() {
+        _drones.value = synchronized(droneMap) { droneMap.values.toList() }
+    }
+
+    /** Publish consistent snapshots of the FAA caches to the UI. */
+    private fun publishFaa() {
+        synchronized(faaCache) {
+            _faa.value = HashMap(faaCache)
+            _faaPlatform.value = HashMap(faaPlatformLabels)
+        }
+    }
 
     @Synchronized
     fun init(context: Context) {
@@ -232,7 +259,9 @@ object DataRepo {
                     synchronized(faaCache) { if (!faaCache.containsKey(id)) faaCache[id] = text }
                 }
                 cache.loadFaaPlatforms().forEach { (id, label) ->
-                    synchronized(faaPlatformLabels) { if (!faaPlatformLabels.containsKey(id)) faaPlatformLabels[id] = label }
+                    // faaPlatformLabels is guarded by the faaCache monitor
+                    // everywhere else (FAA worker, rebuildAll, purgeHistory).
+                    synchronized(faaCache) { if (!faaPlatformLabels.containsKey(id)) faaPlatformLabels[id] = label }
                 }
                 cache.loadSatelliteCache().forEach { (key, pair) ->
                     synchronized(satelliteCounts) {
@@ -242,9 +271,8 @@ object DataRepo {
                 }
             } catch (_: Exception) {
             }
-            _faa.value = HashMap(faaCache)
-            _faaPlatform.value = HashMap(faaPlatformLabels)
-            _satellite.value = HashMap(satelliteCounts)
+            publishFaa()
+            _satellite.value = synchronized(satelliteCounts) { HashMap(satelliteCounts) }
         }
         loadCachedHistory()
         refreshHistoryStats()
@@ -319,7 +347,7 @@ object DataRepo {
         } catch (_: Exception) {
         }
         updateDrone(d, now, faa = true, notify = true)
-        _drones.value = droneMap.values.toList()
+        publishDrones()
     }
 
     private fun updateDrone(d: Detection, ts: Long, faa: Boolean, notify: Boolean) {
@@ -391,7 +419,7 @@ object DataRepo {
                 rows.forEach { updateDrone(it.toDetection(), it.ts, faa = true, notify = false) }
             } catch (_: Exception) {
             }
-            _drones.value = droneMap.values.toList()
+            publishDrones()
             enqueueAllFaa()
         }
     }
@@ -411,7 +439,7 @@ object DataRepo {
                 droneMap.clear()
                 rows.forEach { updateDrone(it.toDetection(), it.ts, faa = true, notify = false) }
             }
-            _drones.value = droneMap.values.toList()
+            publishDrones()
             enqueueAllFaa()
         }
     }
@@ -431,7 +459,7 @@ object DataRepo {
             }
         }
         if (changed) {
-            _drones.value = droneMap.values.toList()
+            publishDrones()
         }
     }
 
@@ -493,8 +521,7 @@ object DataRepo {
                         }
                     }
                 }
-                _faa.value = HashMap(faaCache)
-                _faaPlatform.value = HashMap(faaPlatformLabels)
+                publishFaa()
                 // A definitive result (model resolved, or no-registration ->
                 // simulator) changes the drone inventory, so recompute stats
                 // on a short debounce so the Drones/Flights tabs stay current
@@ -669,11 +696,16 @@ object DataRepo {
                 val scan = try {
                     SatelliteAnalyzer.scanCombined(appContext, wide, tight)
                 } catch (_: Exception) {
-                    SatelliteAnalyzer.AreaScan(emptyMap())
+                    null
                 }
-                applySatelliteScan(key, scan.counts)
-                synchronized(flightClassifiedTs) {
-                    flightClassifiedTs[key] = now
+                // Only a complete scan (all imagery tiles fetched) is applied
+                // and cooled down; a failed/partial one retries next poll
+                // instead of poisoning the 24h cache with black-imagery counts.
+                if (scan != null && scan.complete) {
+                    applySatelliteScan(key, scan.counts)
+                    synchronized(flightClassifiedTs) {
+                        flightClassifiedTs[key] = now
+                    }
                 }
             } finally {
                 synchronized(flightClassifying) {
@@ -732,6 +764,7 @@ object DataRepo {
                 }
                 StatisticsCalculator.computeFlights(rows, simulatorKeys, faaText)
             }
+            _flightsLoaded.value = true
         }
     }
 
@@ -760,24 +793,25 @@ object DataRepo {
             cache.distinctBasicIds().forEach { enqueueFaaLookup(it) }
         } catch (_: Exception) {
         }
+        val dbFlights = try {
+            cache.loadFlights()
+        } catch (_: Exception) {
+            emptyList()
+        }
         _stats.value = try {
             StatisticsCalculator.compute(
-                rows, simulatorKeys, sat, faaText, _droneNotes.value
+                rows, simulatorKeys, sat, faaText, _droneNotes.value, dbFlights
             )
         } catch (_: Exception) {
             null
         }
         if (emitFlights) {
-            val dbFlights = try {
-                cache.loadFlights()
-            } catch (_: Exception) {
-                emptyList()
-            }
             _flights.value = if (dbFlights.isNotEmpty()) {
                 StatisticsCalculator.flightsFromDb(dbFlights, faaText, simulatorKeys)
             } else {
                 StatisticsCalculator.computeFlights(rows, simulatorKeys, faaText)
             }
+            _flightsLoaded.value = true
         }
     }
 
@@ -801,16 +835,18 @@ object DataRepo {
                 val scan = try {
                     SatelliteAnalyzer.scan(appContext, d.droneLat, d.droneLon)
                 } catch (_: Exception) {
-                    SatelliteAnalyzer.AreaScan(emptyMap())
+                    null
                 }
-                val now = System.currentTimeMillis()
-                synchronized(satelliteCounts) {
-                    satelliteCounts[key] = scan.counts
-                    satelliteTs[key] = now
-                }
-                try {
-                    cache.saveSatelliteCache(key, encodeCounts(scan.counts), now)
-                } catch (_: Exception) {
+                if (scan != null && scan.complete) {
+                    val now = System.currentTimeMillis()
+                    synchronized(satelliteCounts) {
+                        satelliteCounts[key] = scan.counts
+                        satelliteTs[key] = now
+                    }
+                    try {
+                        cache.saveSatelliteCache(key, encodeCounts(scan.counts), now)
+                    } catch (_: Exception) {
+                    }
                 }
                 delay(1000L)
             }
@@ -1005,8 +1041,7 @@ object DataRepo {
             } catch (_: Exception) {
             }
         }
-        _faa.value = HashMap(faaCache)
-        _faaPlatform.value = HashMap(faaPlatformLabels)
+        publishFaa()
 
         synchronized(satelliteCounts) {
             satelliteCounts.clear()
@@ -1019,7 +1054,7 @@ object DataRepo {
             } catch (_: Exception) {
             }
         }
-        _satellite.value = HashMap(satelliteCounts)
+        _satellite.value = synchronized(satelliteCounts) { HashMap(satelliteCounts) }
 
         val now = System.currentTimeMillis()
         val retention = retentionMs()
@@ -1033,7 +1068,7 @@ object DataRepo {
             droneMap.clear()
             rows.forEach { updateDrone(it.toDetection(), it.ts, faa = true, notify = false) }
         }
-        _drones.value = droneMap.values.toList()
+        publishDrones()
         enqueueAllFaa()
         refreshHistoryStats()
         refreshStats()
@@ -1058,17 +1093,22 @@ object DataRepo {
                 faaCache.clear()
                 faaRetryAt.clear()
                 faaAttempts.clear()
+                // Also drop queued work, or already-enqueued lookups re-insert
+                // rows into the just-purged faa_cache table.
+                faaQueue.clear()
+                faaQueued.clear()
                 faaPlatformLabels.clear()
             }
-            _faa.value = HashMap(faaCache)
-            _faaPlatform.value = HashMap(faaPlatformLabels)
+            publishFaa()
             synchronized(satelliteCounts) {
                 satelliteCounts.clear()
                 satelliteTs.clear()
             }
-            _satellite.value = HashMap(satelliteCounts)
+            _satellite.value = synchronized(satelliteCounts) { HashMap(satelliteCounts) }
             synchronized(droneMap) { droneMap.clear() }
-            _drones.value = droneMap.values.toList()
+            publishDrones()
+            _flights.value = emptyList()
+            _flightsLoaded.value = true
             _historyStats.value = try {
                 HistoryStats(cache.count(), cache.uniqueDroneCount(), cache.dbSizeBytes())
             } catch (_: Exception) {
@@ -1124,8 +1164,9 @@ object DataRepo {
             ) == PackageManager.PERMISSION_GRANTED
             if (!granted) return
         }
+        val notifId = notifIdFor(key)
         val pi = PendingIntent.getActivity(
-            appContext, key.hashCode(),
+            appContext, notifId,
             Intent(appContext, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                 putExtra(EXTRA_DRONE_KEY, key)
@@ -1142,7 +1183,7 @@ object DataRepo {
             .setAutoCancel(true)
             .build()
         try {
-            NotificationManagerCompat.from(appContext).notify(key.hashCode(), notif)
+            NotificationManagerCompat.from(appContext).notify(notifId, notif)
         } catch (_: Exception) {
         }
     }

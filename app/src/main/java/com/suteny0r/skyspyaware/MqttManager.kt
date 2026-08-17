@@ -50,7 +50,7 @@ class MqttManager(private val context: Context) {
         watchdogJob = scope.launch {
             while (enabled.get()) {
                 delay(WATCHDOG_MS)
-                if (enabled.get() && !connectedFlag.get() && !connecting.get()) {
+                if (enabled.get() && !isConnected() && !connecting.get()) {
                     startConnect(settings)
                 }
             }
@@ -97,6 +97,14 @@ class MqttManager(private val context: Context) {
                 })
                 this@MqttManager.client = c
                 c.connect(opts)
+                if (!enabled.get()) {
+                    // Disconnect was requested while this attempt was in
+                    // flight; don't resurrect the connection.
+                    runCatching { c.disconnect() }
+                    runCatching { c.close() }
+                    if (this@MqttManager.client === c) this@MqttManager.client = null
+                    return@launch
+                }
                 connectedFlag.set(true)
                 val rawTopic = settings.topic.trim('/') + "/raw"
                 c.subscribe(rawTopic, 0)
@@ -125,7 +133,9 @@ class MqttManager(private val context: Context) {
 
     fun disconnect() {
         enabled.set(false)
-        connecting.set(false)
+        // Do NOT clear `connecting` here: an in-flight startConnect owns that
+        // guard and releases it in its own finally. Clearing it early lets a
+        // quick Disconnect->Connect run two attempts concurrently.
         watchdogJob?.cancel()
         val c = client
         client = null
@@ -134,7 +144,10 @@ class MqttManager(private val context: Context) {
         connectedFlag.set(false)
     }
 
-    fun isConnected(): Boolean = connectedFlag.get()
+    // The cached flag can stay stale-true after Doze kills the socket without
+    // a connectionLost callback; trust it only when the client agrees.
+    fun isConnected(): Boolean =
+        connectedFlag.get() && client?.isConnected == true
 
     /**
      * True if a connect failure is worth retrying. Network-level problems

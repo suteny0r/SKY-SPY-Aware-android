@@ -158,17 +158,26 @@ class DetectionCache(context: Context) {
         0L
     }
 
-    /** Delete all stored detections older than [beforeMs]. */
+    /** Delete all stored detections (and completed flights) older than [beforeMs]. */
     fun prune(beforeMs: Long) {
         synchronized(lock) {
             db.delete("detections", "ts < ?", arrayOf(beforeMs.toString()))
+            try {
+                db.delete("flights", "end_ts < ?", arrayOf(beforeMs.toString()))
+            } catch (_: Exception) {
+                // flights table missing in an older DB.
+            }
         }
     }
 
-    /** Delete every stored detection and reclaim the disk space. */
+    /** Delete every stored detection and flight and reclaim the disk space. */
     fun purge(): Long {
         synchronized(lock) {
             val removed = db.delete("detections", null, null).toLong()
+            try {
+                db.delete("flights", null, null)
+            } catch (_: Exception) {
+            }
             try {
                 db.execSQL("VACUUM")
             } catch (_: Exception) {
@@ -262,6 +271,12 @@ class DetectionCache(context: Context) {
     fun exportTo(out: OutputStream): Boolean {
         synchronized(lock) {
             return try {
+                // Fold the WAL into the main file first, or the copy silently
+                // misses everything committed since the last autocheckpoint.
+                try {
+                    db.rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use { it.moveToFirst() }
+                } catch (_: Exception) {
+                }
                 FileInputStream(File(db.path)).use { input -> input.copyTo(out) }
                 true
             } catch (_: Exception) {
@@ -273,17 +288,47 @@ class DetectionCache(context: Context) {
     /** Replace the database with the contents of [input] and reopen it. */
     fun importFrom(input: InputStream): Boolean {
         synchronized(lock) {
-            return try {
-                val temp = File(appContext.cacheDir, "import.db")
+            val temp = File(appContext.cacheDir, "import.db")
+            try {
                 FileOutputStream(temp).use { out -> input.copyTo(out) }
+                // Validate the candidate BEFORE closing/replacing the live DB:
+                // it must be a readable SQLite file, at or below our schema
+                // version (default onDowngrade throws), with a detections table.
+                SQLiteDatabase.openDatabase(
+                    temp.path, null, SQLiteDatabase.OPEN_READONLY
+                ).use { cand ->
+                    val ver = cand.rawQuery("PRAGMA user_version", null).use { c ->
+                        if (c.moveToFirst()) c.getInt(0) else 0
+                    }
+                    if (ver > DB_VERSION) return false
+                    cand.rawQuery("SELECT ts FROM detections LIMIT 1", null).use { }
+                }
+            } catch (_: Exception) {
+                temp.delete()
+                return false
+            }
+            return try {
                 db.close()
                 val target = File(db.path)
                 if (target.exists()) target.delete()
+                // Drop stale sidecars so the imported main file isn't paired
+                // with the previous database's WAL/journal.
+                File(target.path + "-wal").delete()
+                File(target.path + "-shm").delete()
+                File(target.path + "-journal").delete()
                 temp.copyTo(target, overwrite = true)
                 db = helper.writableDatabase
                 true
             } catch (_: Exception) {
+                // Never leave the cache on a closed handle: reopen (recreating
+                // if necessary) so live detections keep persisting.
+                try {
+                    db = helper.writableDatabase
+                } catch (_: Exception) {
+                }
                 false
+            } finally {
+                temp.delete()
             }
         }
     }
@@ -586,12 +631,19 @@ class DetectionCache(context: Context) {
         return out
     }
 
-    private class DetectionDb(context: Context) :
-        SQLiteOpenHelper(context, "detections.db", null, 7) {
+    private companion object {
+        const val DB_VERSION = 7
+    }
 
+    private class DetectionDb(context: Context) :
+        SQLiteOpenHelper(context, "detections.db", null, DB_VERSION) {
+
+        // IF NOT EXISTS throughout: an imported DB written by an external tool
+        // can carry user_version 0 with our tables already present, which
+        // routes through onCreate.
         override fun onCreate(db: SQLiteDatabase) {
             db.execSQL(
-                "CREATE TABLE detections (" +
+                "CREATE TABLE IF NOT EXISTS detections (" +
                     "ts INTEGER NOT NULL," +
                     "mac TEXT NOT NULL," +
                     "rssi INTEGER," +
@@ -602,16 +654,16 @@ class DetectionCache(context: Context) {
                     "pilot_lon REAL," +
                     "basic_id TEXT)"
             )
-            db.execSQL("CREATE INDEX idx_ts ON detections(ts)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_ts ON detections(ts)")
             db.execSQL(
-                "CREATE TABLE faa_cache (basic_id TEXT PRIMARY KEY, result TEXT, platform TEXT)"
+                "CREATE TABLE IF NOT EXISTS faa_cache (basic_id TEXT PRIMARY KEY, result TEXT, platform TEXT)"
             )
             db.execSQL(
-                "CREATE TABLE satellite_cache (" +
+                "CREATE TABLE IF NOT EXISTS satellite_cache (" +
                     "drone_key TEXT PRIMARY KEY, counts TEXT, ts INTEGER)"
             )
             db.execSQL(
-                "CREATE TABLE flights (" +
+                "CREATE TABLE IF NOT EXISTS flights (" +
                     "id INTEGER PRIMARY KEY AUTOINCREMENT," +
                     "key TEXT NOT NULL," +
                     "start_ts INTEGER," +
@@ -623,16 +675,16 @@ class DetectionCache(context: Context) {
                     "distance_m REAL," +
                     "n_points INTEGER)"
             )
-            db.execSQL("CREATE INDEX idx_flights_key ON flights(key)")
-            db.execSQL("CREATE INDEX idx_flights_start ON flights(start_ts)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_flights_key ON flights(key)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_flights_start ON flights(start_ts)")
             db.execSQL(
-                "CREATE TABLE drone_notes (" +
+                "CREATE TABLE IF NOT EXISTS drone_notes (" +
                     "key TEXT PRIMARY KEY," +
                     "note TEXT NOT NULL," +
                     "updated_ts INTEGER)"
             )
             db.execSQL(
-                "CREATE TABLE note_history (" +
+                "CREATE TABLE IF NOT EXISTS note_history (" +
                     "note TEXT PRIMARY KEY," +
                     "updated_ts INTEGER)"
             )

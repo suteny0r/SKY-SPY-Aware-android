@@ -24,7 +24,9 @@ private val OddRow = Color(0xFF00141A)
 @Composable
 fun ConsoleScreen(lines: List<String>) {
     val listState = rememberLazyListState()
-    LaunchedEffect(lines.size) {
+    // Keyed on the list itself, not its size: once the ring buffer is full
+    // the size is constant forever and a size-keyed effect stops firing.
+    LaunchedEffect(lines) {
         if (lines.isNotEmpty()) listState.scrollToItem(lines.size - 1)
     }
     LazyColumn(

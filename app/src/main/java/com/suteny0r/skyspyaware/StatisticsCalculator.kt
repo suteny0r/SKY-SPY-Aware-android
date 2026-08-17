@@ -96,7 +96,13 @@ data class Statistics(
     /** Aircraft category -> number of distinct drones. */
     val categoryCounts: Map<DroneCategory, Int>,
     /** Sum of estimated MSRP across distinct drones (fleet value). */
-    val fleetValueUsd: Long
+    val fleetValueUsd: Long,
+    /**
+     * Number of distinct drones matched to a catalog entry. Distinct from
+     * pilotProfileCounts.values.sum(), which counts a dual-badged drone once
+     * per profile.
+     */
+    val identifiedCount: Int = 0
 )
 
 /**
@@ -117,8 +123,14 @@ object StatisticsCalculator {
         simulatorKeys: Set<String>,
         satellite: Map<String, Map<String, Int>>,
         faaText: Map<String, String> = emptyMap(),
-        notes: Map<String, String> = emptyMap()
+        notes: Map<String, String> = emptyMap(),
+        dbFlights: List<FlightRecord> = emptyList()
     ): Statistics {
+        // Persisted flight segments (import markers) are ground truth; when a
+        // drone has them, prefer their count over gap-based inference so the
+        // Stats "Flights" figure agrees with the Flights tab.
+        val dbFlightCounts = HashMap<String, Int>()
+        for (rec in dbFlights) dbFlightCounts.merge(rec.key, 1, Int::plus)
         val byKey = LinkedHashMap<String, MutableList<StatPoint>>()
         val pilotByKey = HashMap<String, Pair<Double, Double>>()
         val macByKey = HashMap<String, String>()
@@ -127,15 +139,18 @@ object StatisticsCalculator {
         var simDetections = 0L
         for (r in rows) {
             allRows++
-            if (!isValidPosition(r.droneLat, r.droneLon)) continue
             val key = r.basicId.ifBlank { r.mac }
             // Simulator drones are identified by basicIds that fail the FAA
             // registration lookup; exclude them from real-world statistics.
+            // Checked BEFORE the position filter so simulator rows carrying
+            // null-island coordinates still count as excluded simulator
+            // detections instead of inflating totalDetections.
             if (key in simulatorKeys) {
                 simDetections++
                 simSeen.add(key)
                 continue
             }
+            if (!isValidPosition(r.droneLat, r.droneLon)) continue
             // Remember a MAC for OUI-based make attribution (only when there
             // is no basic_id to key on).
             macByKey.putIfAbsent(key, r.mac)
@@ -150,7 +165,10 @@ object StatisticsCalculator {
 
         val dayBuckets = IntArray(7)
         val hourBuckets = IntArray(24)
-        val altBins = IntArray(8)
+        // 9 bins: eight 25m bins covering 0-199m, then 200m+. Must stay in
+        // sync with ALT_LABELS in StatsScreen.
+        val altBins = IntArray(9)
+        var identifiedCount = 0
         val droneStats = ArrayList<DroneStats>()
         val roleCounts = HashMap<PilotRole, Int>()
         val launchCounts = HashMap<LaunchType, Int>()
@@ -180,7 +198,7 @@ object StatisticsCalculator {
                 altSum += alt
                 altN++
                 if (alt > maxAlt) maxAlt = alt
-                altBins[(alt / 25).coerceIn(0, 7)]++
+                altBins[(alt / 25).coerceIn(0, 8)]++
             }
 
             val flights = groupFlights(pts)
@@ -223,10 +241,11 @@ object StatisticsCalculator {
             val msrp = spec?.msrpUsd ?: 0
             if (make.isNotEmpty()) makeCounts.merge(make, 1, Int::plus)
             if (make.isNotEmpty() || model.isNotEmpty()) {
-                val mm = if (model.isNotEmpty()) "$make $model".trim() else make
+                val mm = DroneCatalog.canonicalLabel(make, model)
                 if (mm.isNotEmpty()) modelCounts.merge(mm, 1, Int::plus)
             }
             if (spec != null) {
+                identifiedCount++
                 spec.pilotProfiles.forEach { pilotProfileCounts.merge(it, 1, Int::plus) }
                 spec.categories.forEach { categoryCounts.merge(it, 1, Int::plus) }
                 fleetValueUsd += msrp
@@ -236,7 +255,7 @@ object StatisticsCalculator {
                 DroneStats(
                     key = key,
                     detections = pts.size,
-                    flights = flights.size,
+                    flights = dbFlightCounts[key] ?: flights.size,
                     flightTimeMs = flightTime,
                     distanceM = dist,
                     avgSpeedMs = if (fSpeedN > 0) fspeed / fSpeedN else 0.0,
@@ -271,7 +290,9 @@ object StatisticsCalculator {
         // "Drone models" tree can list every drone under its model.
         val modelDrones = LinkedHashMap<String, MutableList<String>>()
         for (d in droneStats) {
-            val mm = if (d.model.isNotEmpty()) "${d.make} ${d.model}".trim() else d.make
+            // Same canonical label as modelCounts, so serial-suffix variants
+            // of one model ("Mavic Air 2 (MA2UE3W)") group under one node.
+            val mm = DroneCatalog.canonicalLabel(d.make, d.model)
             if (mm.isEmpty()) continue
             modelDrones.getOrPut(mm) { mutableListOf() }.add(d.key)
         }
@@ -300,7 +321,8 @@ object StatisticsCalculator {
             modelDrones = modelDrones,
             pilotProfileCounts = pilotProfileCounts,
             categoryCounts = categoryCounts,
-            fleetValueUsd = fleetValueUsd
+            fleetValueUsd = fleetValueUsd,
+            identifiedCount = identifiedCount
         )
     }
 
@@ -406,8 +428,17 @@ object StatisticsCalculator {
             for (seg in groupFlights(pts)) {
                 var dist = 0.0
                 for (i in 1 until seg.size) {
-                    val d = haversine(seg[i - 1].lat, seg[i - 1].lon, seg[i].lat, seg[i].lon)
+                    val a = seg[i - 1]
+                    val b = seg[i]
+                    // Same segment filters as compute(): unfiltered summing
+                    // adds the full haversine length of zero-dt GPS flip-flops
+                    // and bogus teleports, so the Flights tab would contradict
+                    // the Stats tab's total distance for the same history.
+                    val dt = (b.ts - a.ts) / 1000.0
+                    if (dt < MIN_SPEED_SEG_S || dt > MAX_SPEED_SEG_S) continue
+                    val d = haversine(a.lat, a.lon, b.lat, b.lon)
                     if (d <= 0) continue
+                    if (d / dt > MAX_PLAUSIBLE_SPEED_MS) continue
                     dist += d
                 }
                 var latSum = 0.0
@@ -449,8 +480,11 @@ object StatisticsCalculator {
         for (rec in records) {
             if (rec.key in simulatorKeys) continue
             val key = rec.key
+            // MAC-keyed records carry the MAC as the key itself; pass it
+            // through so the OUI-based make fallback still fires.
             val basicId = if (key.contains(':')) "" else key
-            val (make, model) = DroneIdentity.resolve(basicId, "", faaText[basicId])
+            val mac = if (key.contains(':')) key else ""
+            val (make, model) = DroneIdentity.resolve(basicId, mac, faaText[basicId])
             out.add(
                 FlightSummary(
                     droneKey = key,

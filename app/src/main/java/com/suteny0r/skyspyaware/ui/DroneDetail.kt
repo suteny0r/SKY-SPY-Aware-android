@@ -21,8 +21,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.suteny0r.skyspyaware.DataRepo
 import com.suteny0r.skyspyaware.Drone
-import com.suteny0r.skyspyaware.FAA_NOT_FOUND
 import com.suteny0r.skyspyaware.isValidPosition
 import java.util.Locale
 
@@ -45,7 +45,9 @@ fun DroneDetail(
             d.basicId.ifBlank { d.mac },
             style = MaterialTheme.typography.titleLarge
         )
-        if (faa == FAA_NOT_FOUND) {
+        // Same simulator test as the stats exclusion, so this banner and the
+        // "excluded from statistics" set never disagree about one drone.
+        if (DataRepo.isSimulator(faa)) {
             Text(
                 "Simulator / unregistered",
                 style = MaterialTheme.typography.labelMedium,
@@ -75,22 +77,29 @@ fun DroneDetail(
         DetailRow("Last seen", formatTime(d.lastSeen))
         DetailRow("RSSI", "${d.rssi} dBm")
         DetailRow("Altitude", "${d.droneAltitude} m (${(d.droneAltitude * 3.28084).toInt()} ft)")
+        val droneHasPos = isValidPosition(d.droneLat, d.droneLon)
         DetailRow(
             "Drone",
-            String.format(Locale.US, "%.6f, %.6f", d.droneLat, d.droneLon)
+            if (droneHasPos) {
+                String.format(Locale.US, "%.6f, %.6f", d.droneLat, d.droneLon)
+            } else {
+                "unknown"
+            }
         )
         if (isValidPosition(d.pilotLat, d.pilotLon)) {
             DetailRow(
                 "Pilot",
                 String.format(Locale.US, "%.6f, %.6f", d.pilotLat, d.pilotLon)
             )
-            DetailRow(
-                "Pilot distance",
-                String.format(
-                    Locale.US, "%.2f km",
-                    haversine(d.droneLat, d.droneLon, d.pilotLat, d.pilotLon) / 1000.0
+            if (droneHasPos) {
+                DetailRow(
+                    "Pilot distance",
+                    String.format(
+                        Locale.US, "%.2f km",
+                        haversine(d.droneLat, d.droneLon, d.pilotLat, d.pilotLon) / 1000.0
+                    )
                 )
-            )
+            }
         } else {
             DetailRow("Pilot", "unknown")
         }
@@ -108,7 +117,11 @@ fun DroneDetail(
         }
 
         onNoteChange?.let { save ->
-            var noteText by remember(note) { mutableStateOf(note) }
+            // Keyed on the drone too: pager page slots can rebind to a
+            // different drone whose saved note string is equal (usually ""),
+            // and a note-only key would carry the previous drone's unsaved
+            // draft across.
+            var noteText by remember(d.key, note) { mutableStateOf(note) }
             OutlinedTextField(
                 value = noteText,
                 onValueChange = { noteText = it },

@@ -42,8 +42,10 @@ import com.suteny0r.skyspyaware.Statistics
 import java.util.Locale
 
 private val DAY_LABELS = listOf("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
-private val HOUR_LABELS = listOf("0", "", "", "", "", "", "6", "", "", "", "", "", "12", "", "", "", "", "", "18", "", "", "", "", "24")
-private val ALT_LABELS = listOf("<25", "50", "75", "100", "125", "150", "175", "200+")
+private val HOUR_LABELS = listOf("0", "", "", "", "", "", "6", "", "", "", "", "", "12", "", "", "", "", "", "18", "", "", "", "", "23")
+// One label per histogram bin (9 bins: eight 25m bins for 0-199m, then
+// 200m+); must stay in sync with StatisticsCalculator's altBins.
+private val ALT_LABELS = listOf("<25", "25", "50", "75", "100", "125", "150", "175", "200+")
 
 private fun roleColor(role: PilotRole): Color = when (role) {
     PilotRole.PORT_INSPECTION -> Color(0xFF00BCD4)
@@ -156,8 +158,8 @@ fun StatsScreen(vm: SkySpyViewModel, onSelect: (String) -> Unit) {
                 }
             }
             Text(
-                "Heuristic guess from where each drone flies (Port of Miami / " +
-                    "beach zones, hover patterns and altitude).",
+                "Heuristic guess from where each drone flies (satellite objects " +
+                    "in the scan area, hover patterns and altitude).",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
             )
@@ -170,8 +172,11 @@ fun SectionTitle(text: String) {
     Text(text, style = MaterialTheme.typography.titleMedium)
 }
 
+// Every call site passes the caption first ("Detections", value), so the
+// parameters are (label, value); the VALUE renders large with the caption
+// beneath it.
 @Composable
-fun StatCell(value: String, label: String, modifier: Modifier = Modifier) {
+fun StatCell(label: String, value: String, modifier: Modifier = Modifier) {
     Column(
         modifier = modifier
             .background(

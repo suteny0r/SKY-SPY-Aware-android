@@ -97,9 +97,17 @@ object DroneClassifier {
                 "farm", "utility", "real estate"
             )
         )
+        // Whole-word matching: raw substring containment lets short keywords
+        // fire inside unrelated words ("port" in "transport", "cg" in
+        // "mcgregor", "site" in "website") and silently override the
+        // evidence-based classifier.
+        val tokens = Regex("[a-z0-9+]+").findAll(n).map { it.value }.toSet()
+        fun hit(w: String): Boolean =
+            if (' ' in w) Regex("\\b${Regex.escape(w)}\\b").containsMatchIn(n)
+            else w in tokens
         for ((role, words) in hints) {
             for (w in words) {
-                if (w in n) return role to "note says \"$note\""
+                if (hit(w)) return role to "note says \"$note\""
             }
         }
         return null

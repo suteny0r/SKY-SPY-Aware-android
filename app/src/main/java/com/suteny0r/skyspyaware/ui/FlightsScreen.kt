@@ -38,6 +38,7 @@ private val FLIGHT_DATE = SimpleDateFormat("MMM d, HH:mm", Locale.US)
 @Composable
 fun FlightsScreen(vm: SkySpyViewModel, onSelectFlight: (FlightSummary) -> Unit) {
     val flights by vm.flights.collectAsState()
+    val loaded by vm.flightsLoaded.collectAsState()
 
     LaunchedEffect(Unit) {
         vm.refreshFlights()
@@ -46,7 +47,8 @@ fun FlightsScreen(vm: SkySpyViewModel, onSelectFlight: (FlightSummary) -> Unit) 
     if (flights.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text(
-                "Computing flights from full history...",
+                if (loaded) "No flights in history yet."
+                else "Computing flights from full history...",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
             )
